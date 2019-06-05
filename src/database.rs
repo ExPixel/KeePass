@@ -5,6 +5,9 @@ use crate::memutil::{ProtectedString, ProtectedBinary};
 use crate::vdict::VariantDict;
 use crate::context::Context;
 use crate::crypto::kdf::{KdfParameters};
+use crate::memutil;
+use crate::crypto::kdf;
+use crate::error::Error;
 
 
 /// Core password manager. Contains groups which themselves contain password entries.
@@ -14,6 +17,7 @@ pub struct PwDatabase {
     pub(crate) compression_algorithm: PwCompressionAlgorithm,
     pub(crate) kdf_parameters: KdfParameters,
     pub(crate) public_custom_data: VariantDict,
+    pub(crate) master_key: CompositeKey,
 }
 
 impl PwDatabase {
@@ -24,7 +28,12 @@ impl PwDatabase {
             compression_algorithm: PwCompressionAlgorithm::None,
             kdf_parameters: KdfParameters::new(PwUUID::zero()),
             public_custom_data: VariantDict::new(),
+            master_key: CompositeKey::new(),
         }
+    }
+
+    pub fn add_user_key(&mut self, key: UserKey) {
+        self.master_key.add_user_key(key);
     }
 }
 
@@ -117,7 +126,7 @@ impl std::fmt::Display for PwUUID {
 /// Master password/passphrase as provided by the user.
 pub struct KcpPassword {
     /// Key data for the user password/passphrase.
-    pub(crate) key_data: Vec<u8>,
+    pub(crate) key_data: ProtectedBinary,
 
     /// The password as a string. This is None unless the password is set to be remembered during
     /// the construction of the KcpPassword.
@@ -132,12 +141,11 @@ impl KcpPassword {
         let hash = hasher.result();
 
         let mut key_data = Vec::with_capacity(hash.len());
-        for b in hash.iter() {
-            key_data.push(*b);
-        }
+        key_data.resize(hash.len(), 0);
+        (&mut key_data[0..]).copy_from_slice(&hash);
 
         KcpPassword {
-            key_data: key_data,
+            key_data: ProtectedBinary::wrap(key_data),
             password: if remember {
                 Some(password)
             } else {
@@ -206,6 +214,46 @@ impl CompositeKey {
 
     pub fn clear(&mut self) {
         self.user_keys.clear();
+    }
+
+    pub fn validate_user_keys(&self) -> Result<(), Error> {
+        // @TODO for now this just returns true, but it should actually check that there is at most
+        // one user account in the composite key list.
+
+        Ok(())
+    }
+
+    /// Creates the composite key from the supplied user key sources (password, key file, user account, computer ID, ect.)
+    pub fn create_raw_composite_key_32(&self) -> Result<ProtectedBinary, Error> {
+
+        let _ = self.validate_user_keys()?;
+
+        let mut data = Vec::new();
+        for user_key in self.user_keys.iter() {
+            data.extend_from_slice(user_key.get_key_data());
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.input(&data);
+        let ret = ProtectedBinary::copy_slice(&hasher.result());
+
+        memutil::zero_vec(&mut data);
+
+        Ok(ret)
+    }
+
+    /// Generate a 32 byte (256-bit) composite key.
+    pub fn generate_key_32(&self, params: &KdfParameters) -> Result<ProtectedBinary, Error> {
+        let raw32 = self.create_raw_composite_key_32()?;
+        debug_assert!(raw32.len() == 32, "Raw composite key did not have a length of 32.");
+
+        let kdf = kdf::get_kdf_engine(&params.kdf_uuid).ok_or(Error::Generic("No KDF engine matching UUID"))?;
+
+        let mut trf32 = kdf.transform(&raw32, &params)?;
+
+        let ret = ProtectedBinary::copy_slice(&trf32);
+        memutil::zero_slice(&mut trf32);
+        Ok(ret)
     }
 }
 

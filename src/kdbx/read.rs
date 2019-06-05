@@ -2,7 +2,7 @@ use std::io::prelude::*;
 use std::io::BufReader;
 use std::path::Path;
 use xml::reader::{EventReader, XmlEvent};
-use sha2::{Sha256, Digest as _};
+use sha2::{Sha256, Sha512, Digest as _};
 
 use crate::error::{self, Error};
 use crate::database::{PwDatabase, PwUUID, PwCompressionAlgorithm};
@@ -10,12 +10,15 @@ use crate::memutil::{self, ProtectedBinary};
 use crate::ioutil::{self, StoredReadRef};
 use crate::crypto::kdf;
 use crate::crypto::crs::CrsAlgorithm;
+use crate::crypto::cipher::{CipherEngine, TransformRead};
+use crate::cryptoutil;
 
 use super::*;
 
 pub struct Kdbx {
     signature: (u32, u32),
     version: u32,
+    master_seed: ProtectedBinary,
     encryption_iv: ProtectedBinary,
     inner_random_stream_key: ProtectedBinary,
     stream_start_bytes: ProtectedBinary,
@@ -29,6 +32,7 @@ impl Kdbx {
         Kdbx {
             signature: (0, 0),
             version: 0,
+            master_seed: ProtectedBinary::empty(),
             encryption_iv: ProtectedBinary::empty(),
             inner_random_stream_key: ProtectedBinary::empty(),
             stream_start_bytes: ProtectedBinary::empty(),
@@ -36,6 +40,39 @@ impl Kdbx {
             hash_of_header: ProtectedBinary::empty(),
             hash_of_file_on_disk: ProtectedBinary::empty(),
         }
+    }
+
+    pub fn get_cipher(database: &PwDatabase, enc_key_len: &mut usize, enc_iv_len: &mut usize) -> Option<&'static CipherEngine> {
+        use crate::crypto::cipher;
+        let maybe_engine = cipher::get_cipher_engine(&database.data_cipher_uuid);
+        if let Some(ref engine) = maybe_engine {
+            *enc_key_len = engine.key_length();
+            *enc_iv_len = engine.iv_length();
+        } else {
+            *enc_key_len = 32;
+            *enc_iv_len = 16;
+        };
+        return maybe_engine;
+    }
+
+    pub fn compute_keys(&self, database: &PwDatabase, cipherkey: &mut [u8], hmackey64: &mut [u8]) -> Result<(), Error> {
+        debug_assert!(self.master_seed.len() == 32, "Master seed must have a length of 32 bytes.");
+        assert!(hmackey64.len() == 64, " HMac64 length must be 64 bytes.");
+        let mut cmp = [0u8; 65];
+        (&mut cmp[0..32]).copy_from_slice(&self.master_seed);
+
+        let binuser = database.master_key.generate_key_32(&database.kdf_parameters)?;
+        (&mut cmp[32..64]).copy_from_slice(&binuser);
+        cryptoutil::resize_key(&cmp[0..64], cipherkey);
+        cmp[64] = 1;
+
+        let mut hasher = Sha512::new();
+        hasher.input(&cmp[0..]);
+        hmackey64.copy_from_slice(&hasher.result());
+
+        memutil::zero_slice(&mut cmp);
+
+        Ok(())
     }
 }
 
@@ -63,6 +100,42 @@ pub fn load_kdbx<R: Read>(input: &mut R, database: &mut PwDatabase) -> Result<()
         ProtectedBinary::copy_slice(&hasher.result())
     };
 
+    let mut enc_key_len = 0;
+    let mut enc_iv_len = 0;
+    let cipher_engine = Kdbx::get_cipher(database, &mut enc_key_len, &mut enc_iv_len).ok_or(Error::BadFormat("Bad cipher engine UUID."))?;
+
+    let mut cipher_key_and_iv = Vec::with_capacity(enc_key_len + enc_iv_len);
+    cipher_key_and_iv.resize(enc_key_len + enc_iv_len, 0);
+    let mut hmackey64 = [0u8; 64];
+    kdbx.compute_keys(database, &mut cipher_key_and_iv[0..enc_key_len], &mut hmackey64)?;
+
+    (&mut cipher_key_and_iv[enc_key_len..]).copy_from_slice(&kdbx.encryption_iv[0..enc_iv_len]);
+    let cipherkey = &cipher_key_and_iv[0..enc_key_len];
+    let cipheriv = &cipher_key_and_iv[enc_key_len..];
+
+    if kdbx.version < FILE_VERSION_32_4 {
+        // KDBX < 4
+
+        let mut decrypt_transform = cipher_engine.decrypt_stream(cipherkey, cipheriv);
+        let mut decrypt_stream = TransformRead::new(&mut input, &mut *decrypt_transform);
+
+        let mut start_stream_bytes = [0u8; 32];
+        decrypt_stream.read_exact(&mut start_stream_bytes[0..]).map_err(|e| Error::IO(e))?;
+        if start_stream_bytes != &kdbx.stream_start_bytes[0..] {
+            return Err(Error::BadFormat("File corrupted (bad start bytes)"));
+        }
+
+        load_kdbx_unencrypted(&mut decrypt_stream, database, &kdbx)?;
+    } else {
+        // KDBX >= 4
+        unimplemented!("kdbx.version >= 4 decryption no yet implemented");
+    }
+
+
+    Ok(())
+}
+
+pub fn load_kdbx_unencrypted<R: Read>(input: &mut R, database: &mut PwDatabase, kdbx: &Kdbx) -> Result<(), Error> {
     let parser = EventReader::new(input);
 
     for evt in parser {
@@ -81,6 +154,11 @@ pub fn load_kdbx<R: Read>(input: &mut R, database: &mut PwDatabase) -> Result<()
 
     Ok(())
 }
+
+fn load_inner_header<R: Read>(input: &mut R, database: &mut PwDatabase, kdbx: &mut Kdbx) -> Result<(), Error> {
+    Ok(())
+}
+
 
 fn load_header<R: Read>(input: &mut R, database: &mut PwDatabase, kdbx: &mut Kdbx) -> Result<(), Error> {
     let sig1 = ioutil::io_read_u32(input)?;
@@ -163,6 +241,7 @@ fn read_header_field<R: Read>(input: &mut R, database: &mut PwDatabase, kdbx: &m
         },
 
         Some(KdbxHeaderFieldID::MasterSeed) => {
+            kdbx.master_seed = ProtectedBinary::copy_slice(data);
             database.context.crypto_random.add_entropy(data);
             debug_println!("Set MasterSeed.");
         },

@@ -228,6 +228,12 @@ pub fn zero_slice<T: Sized>(dst: &mut [T]) {
     }
 }
 
+pub fn zero_vec<T: Sized + Clone + Default>(dst: &mut Vec<T>) {
+    dst.resize(dst.capacity(), T::default());
+    zero_slice(&mut dst[0..]);
+    dst.clear();
+}
+
 /// A string that has its memory zeroed when it is dropped.
 /// #TODO In KeePass's implementation the string is stored encrypted in memory.
 ///       I'm not sure how useful that is since it's constantly being unencrypted anyway

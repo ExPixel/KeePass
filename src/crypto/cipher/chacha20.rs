@@ -3,6 +3,8 @@ use crate::database::PwUUID;
 use super::CipherEngine;
 use super::CtrBlockCipher;
 
+use super::Transform;
+
 /// The basic operation of the ChaCha algorithm is the quarter round.  It
 /// operates on four 32-bit unsigned integers, denoted a, b, c, and d.
 /// The operation is as follows (in C-like notation):
@@ -194,13 +196,21 @@ impl CipherEngine for ChaCha20Engine {
         ChaCha20Engine::NAME
     }
 
-    fn encrypt_stream(&self, stream: Box<Read>, key: &[u8], iv: &[u8]) -> Box<Read> {
-        Box::new(ChaCha20Encrypt::new(ChaCha20::new(key, iv), stream))
+    fn key_length(&self) -> usize {
+        32
     }
 
-    fn decrypt_stream(&self, stream: Box<Read>, key: &[u8], iv: &[u8]) -> Box<Read> {
+    fn iv_length(&self) -> usize {
+        12
+    }
+
+    fn encrypt_stream(&self, key: &[u8], iv: &[u8]) -> Box<Transform> {
+        Box::new(ChaCha20Encrypt::new(ChaCha20::new(key, iv)))
+    }
+
+    fn decrypt_stream(&self, key: &[u8], iv: &[u8]) -> Box<Transform> {
         // decrypt is the same as encrypt
-        Box::new(ChaCha20Encrypt::new(ChaCha20::new(key, iv), stream))
+        Box::new(ChaCha20Encrypt::new(ChaCha20::new(key, iv)))
     }
 }
 
@@ -208,9 +218,6 @@ impl CipherEngine for ChaCha20Engine {
 struct ChaCha20Encrypt {
     /// ChaCha20 instance used for encryption.
     chacha: ChaCha20,
-
-    /// Stream being read and encrypted on demand.
-    stream: Box<Read>,
 
     /// Buffer containing data that has already been encrypted.
     /// This buffer is also used to temporarily hold unencrypted data while reading.
@@ -224,10 +231,9 @@ struct ChaCha20Encrypt {
 }
 
 impl ChaCha20Encrypt {
-    pub fn new(chacha: ChaCha20, stream: Box<Read>) -> ChaCha20Encrypt {
+    pub fn new(chacha: ChaCha20) -> ChaCha20Encrypt {
         ChaCha20Encrypt {
             chacha: chacha,
-            stream: stream,
             buffer: [0u8; 64],
             cursor: 0,
             buflen: 0,
@@ -235,8 +241,8 @@ impl ChaCha20Encrypt {
     }
 }
 
-impl Read for ChaCha20Encrypt {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+impl Transform for ChaCha20Encrypt {
+    fn transform(&mut self, stream: &mut Read, buf: &mut [u8]) -> std::io::Result<usize> {
         // if all of the data in the buffer has already been read.
         if self.cursor >= self.buflen {
             self.cursor = 0;
@@ -244,7 +250,7 @@ impl Read for ChaCha20Encrypt {
 
             // Attempt to fill the buffer before encrypting.
             while self.buflen < self.buffer.len() {
-                match self.stream.read(&mut self.buffer[self.buflen..]) {
+                match stream.read(&mut self.buffer[self.buflen..]) {
                     Ok(0) => {
                         break; // EOF
                     },
@@ -286,6 +292,7 @@ impl Drop for ChaCha20Encrypt {
 
 #[cfg(test)]
 mod test {
+    use super::super::TransformRead;
     use super::*;
 
     #[test]
@@ -410,9 +417,10 @@ mod test {
             0x87, 0x4d,
         ];
 
-        let mut stream = Box::new(std::io::Cursor::new(&test_plaintext[0..]));
+        let mut stream = std::io::Cursor::new(&test_plaintext[0..]);
         let mut chacha = ChaCha20::with_block_count(1, &test_key, &test_nonce);
-        let mut stream_encrypt = ChaCha20Encrypt::new(chacha, stream);
+        let mut transform = ChaCha20Encrypt::new(chacha);
+        let mut stream_encrypt = TransformRead::new(&mut stream, &mut transform);
         let mut test_result = Vec::new();
         stream_encrypt.read_to_end(&mut test_result);
         assert_eq!(&test_expected[0..], &test_result[0..]);

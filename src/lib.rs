@@ -18,6 +18,7 @@ pub mod vdict;
 pub mod context;
 pub mod constants;
 pub mod crypto;
+pub mod cryptoutil;
 
 #[cfg(test)]
 mod tests {

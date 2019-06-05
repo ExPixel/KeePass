@@ -40,45 +40,64 @@ impl KdfParameters {
     }
 }
 
+// @TODO change this to be more like the static ciphers
+static KDF_ENGINE_AES: KdfEngine = KdfEngine::Aes;
+static KDF_ENGINE_ARGON2: KdfEngine = KdfEngine::Argon2;
+
+pub fn get_kdf_engine(uuid: &PwUUID) -> Option<&'static KdfEngine> {
+    match *uuid {
+        aes::UUID => Some(&KDF_ENGINE_AES),
+        argon2::UUID => Some(&KDF_ENGINE_ARGON2),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub enum KdfEngine {
     Aes,
+    Argon2,
 }
 
 impl KdfEngine {
     pub fn uuid(&self) -> PwUUID {
         match self {
             &KdfEngine::Aes => aes::UUID,
+            &KdfEngine::Argon2 => argon2::UUID,
         }
     }
 
     pub fn name(&self) -> &'static str {
         match self {
             &KdfEngine::Aes => aes::NAME,
+            &KdfEngine::Argon2 => argon2::NAME,
         }
     }
 
     pub fn transform(&self, msg: &[u8], params: &KdfParameters) -> Result<[u8; 32], Error> {
         match self {
             &KdfEngine::Aes => aes::transform(msg, params),
+            &KdfEngine::Argon2 => argon2::transform(msg, params),
         }
     }
 
     pub fn randomize(&self, context: &mut Context, params: &mut KdfParameters) {
         match self {
             &KdfEngine::Aes => aes::randomize(context, params),
+            &KdfEngine::Argon2 => argon2::randomize(context, params),
         }
     }
 
     pub fn default_parameters(&self) -> KdfParameters {
         match self {
             &KdfEngine::Aes => aes::default_parameters(),
+            &KdfEngine::Argon2 => argon2::default_parameters(),
         }
     }
 
     pub fn best_parameters(&self, millis: u64) -> KdfParameters {
         match self {
             &KdfEngine::Aes => aes::best_parameters(millis),
+            &KdfEngine::Argon2 => argon2::best_parameters(millis),
         }
     }
 
@@ -234,7 +253,7 @@ pub mod aes {
 
         let mut new_key = [0u8; 32];
         new_key.copy_from_slice(original_key_32);
-        encrypt256(key_seed_32, &mut new_key, rounds);
+        transform_key_256(&mut new_key, &key_seed_32, rounds);
 
         let mut hasher = Sha256::new();
         hasher.input(&new_key);
@@ -244,45 +263,24 @@ pub mod aes {
         Ok((new_key))
     }
 
-    /// Encrypts data using AES128. The size of `data` must be a multiple of 16.
-    /// The size of the `key` must be 32 bytes.
-    pub fn encrypt256(key: &[u8], data: &mut [u8], rounds: u64) {
+    pub fn transform_key_256(new_key: &mut [u8], key_seed_32: &[u8], rounds: u64) {
         use aes::Aes256;
         use aes::block_cipher_trait::generic_array::GenericArray;
         use aes::block_cipher_trait::BlockCipher;
 
-        assert!(key.len() == 32, "The key must be 32 bytes (256 bits) long.");
-        assert!(data.len() % 16 == 0, "The size of data must be a multiple of 16.");
+        assert!(key_seed_32.len() == 32, "The key must be 32 bytes (256 bits) long.");
+        assert!(new_key.len() % 16 == 0, "The size of data must be a multiple of 16.");
 
-        let cipher = Aes256::new(GenericArray::from_slice(key));
+        let cipher = Aes256::new(GenericArray::from_slice(key_seed_32));
 
         for _ in 0..rounds {
-            for block in data.chunks_mut(16) {
+            for block in new_key.chunks_mut(16) {
                 let mut block = GenericArray::from_mut_slice(block);
                 cipher.encrypt_block(&mut block);
             }
         }
     }
 
-    /// Decrypts data using AES128. The size of `data` must be a multiple of 16.
-    /// The size of the `key` must be 32 bytes.
-    pub fn decrypt256(key: &[u8], data: &mut [u8], rounds: u64) {
-        use aes::Aes256;
-        use aes::block_cipher_trait::generic_array::GenericArray;
-        use aes::block_cipher_trait::BlockCipher;
-
-        assert!(key.len() == 32, "The key must be 32 bytes (256 bits) long.");
-        assert!(data.len() % 16 == 0, "The size of data must be a multiple of 16.");
-
-        let cipher = Aes256::new(GenericArray::from_slice(key));
-
-        for _ in 0..rounds {
-            for block in data.chunks_mut(16) {
-                let mut block = GenericArray::from_mut_slice(block);
-                cipher.decrypt_block(&mut block);
-            }
-        }
-    }
 
     /// Returns the best parameters to to use in order to have the KDF run for a given number of
     /// milliseconds.

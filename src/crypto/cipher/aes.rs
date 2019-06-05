@@ -1,3 +1,4 @@
+use super::Transform;
 use std::io::Read;
 use crate::database::PwUUID;
 use super::CipherEngine;
@@ -33,18 +34,25 @@ impl CipherEngine for StandardAesEngine {
         StandardAesEngine::NAME
     }
 
-    fn encrypt_stream(&self, stream: Box<Read>, key: &[u8], iv: &[u8]) -> Box<Read> {
-        unimplemented!("StandardAesEngine::encrypt_stream");
+    fn key_length(&self) -> usize {
+        32
     }
 
-    fn decrypt_stream(&self, stream: Box<Read>, key: &[u8], iv: &[u8]) -> Box<Read> {
-        unimplemented!("StandardAesEngine::decrypt_stream");
+    fn iv_length(&self) -> usize {
+        16
+    }
+
+    fn encrypt_stream(&self, key: &[u8], iv: &[u8]) -> Box<Transform> {
+        Box::new(StandardAesEncrypt::new(key, iv))
+    }
+
+    fn decrypt_stream(&self, key: &[u8], iv: &[u8]) -> Box<Transform> {
+        Box::new(StandardAesDecrypt::new(key, iv))
     }
 }
 
 /// AES256 CBC implementation.
 struct StandardAesEncrypt {
-    stream: Box<Read>,
     aes: Aes256,
     key: [u8; AES_KEY_SIZE],
     /// If the buffer has already been fully read, this contains the IV for the next block.
@@ -57,12 +65,11 @@ struct StandardAesEncrypt {
 }
 
 impl StandardAesEncrypt {
-    pub fn new(key: &[u8], iv: &[u8], stream: Box<Read>) -> StandardAesEncrypt {
+    pub fn new(key: &[u8], iv: &[u8]) -> StandardAesEncrypt {
         assert!(key.len() == AES_KEY_SIZE, "bad key length");
         assert!( iv.len() == AES_BLOCK_SIZE, "bad IV length");
 
         let mut sae = StandardAesEncrypt {
-            stream: stream,
             aes: Aes256::new_varkey(&key).unwrap(),
             key: [0u8; AES_KEY_SIZE],
             buffer: [0u8; AES_BLOCK_SIZE * 2],
@@ -77,8 +84,8 @@ impl StandardAesEncrypt {
     }
 }
 
-impl Read for StandardAesEncrypt {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+impl Transform for StandardAesEncrypt {
+    fn transform(&mut self, stream: &mut Read, buf: &mut [u8]) -> std::io::Result<usize> {
         // if all of the data in the buffer has already been read.
         if self.cursor >= self.buflen {
             if self.done {
@@ -93,7 +100,7 @@ impl Read for StandardAesEncrypt {
 
             // Attempt to fill the buffer before encrypting.
             while self.buflen < AES_BLOCK_SIZE {
-                match self.stream.read(&mut self.buffer[self.buflen..AES_BLOCK_SIZE]) {
+                match stream.read(&mut self.buffer[self.buflen..AES_BLOCK_SIZE]) {
                     Ok(0) => {
                         self.done = true;
                         break; // EOF
@@ -156,7 +163,6 @@ impl Read for StandardAesEncrypt {
 
 /// AES256 CBC implementation.
 struct StandardAesDecrypt {
-    stream: Box<Read>,
     aes: Aes256,
     buffer: [u8; AES_BLOCK_SIZE],
     iv: [u8; AES_BLOCK_SIZE],
@@ -167,12 +173,11 @@ struct StandardAesDecrypt {
 }
 
 impl StandardAesDecrypt {
-    pub fn new(key: &[u8], iv: &[u8], stream: Box<Read>) -> StandardAesDecrypt {
+    pub fn new(key: &[u8], iv: &[u8]) -> StandardAesDecrypt {
         assert!(key.len() == AES_KEY_SIZE, "bad key length");
         assert!( iv.len() == AES_BLOCK_SIZE, "bad IV length");
 
         let mut sad = StandardAesDecrypt {
-            stream: stream,
             aes: Aes256::new_varkey(&key).unwrap(),
             buffer: [0u8; AES_BLOCK_SIZE],
             iv: [0u8; AES_BLOCK_SIZE],
@@ -188,8 +193,8 @@ impl StandardAesDecrypt {
     }
 }
 
-impl Read for StandardAesDecrypt {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+impl Transform for StandardAesDecrypt {
+    fn transform(&mut self, stream: &mut Read, buf: &mut [u8]) -> std::io::Result<usize> {
         // if all of the data in the buffer has already been read.
         if self.cursor >= self.buflen {
             if self.done {
@@ -209,7 +214,7 @@ impl Read for StandardAesDecrypt {
 
             // Attempt to fill the buffer before encrypting.
             while self.buflen < AES_BLOCK_SIZE {
-                match self.stream.read(&mut self.buffer[self.buflen..]) {
+                match stream.read(&mut self.buffer[self.buflen..]) {
                     Ok(0) => {
                         last_block = true;
                         break; // EOF
@@ -230,7 +235,7 @@ impl Read for StandardAesDecrypt {
             if !last_block {
                 let mut next_byte_arr = [0u8; 1];
                 loop {
-                    match self.stream.read(&mut next_byte_arr) {
+                    match stream.read(&mut next_byte_arr) {
                         Ok(0) => {
                             last_block = true;
                             break;
@@ -285,6 +290,7 @@ impl Read for StandardAesDecrypt {
 
 #[cfg(test)]
 pub mod test {
+    use super::super::TransformRead;
     use super::*;
     use crate::memutil;
 
@@ -298,12 +304,16 @@ pub mod test {
         let ciphertext = memutil::hex_to_bytes(b"b2eb05e2c39be9fcda6c19078c6a9d1b");
         let ciphertext_padded = memutil::hex_to_bytes(b"B2EB05E2C39BE9FCDA6C19078C6A9D1B3F461796D6B0D6B2E0C2A72B4D80E644");
 
-        let mut encrypt_stream = StandardAesEncrypt::new(&key, &iv, Box::new(std::io::Cursor::new(plaintext.clone())));
+        let mut read_stream = std::io::Cursor::new(plaintext.clone());
+        let mut encrypt_transform = StandardAesEncrypt::new(&key, &iv);
+        let mut encrypt_stream = TransformRead::new(&mut read_stream, &mut encrypt_transform);
         let mut encrypt_result = Vec::new();
         encrypt_stream.read_to_end(&mut encrypt_result);
         assert_eq!(&ciphertext_padded[0..], &encrypt_result[0..]);
 
-        let mut decrypt_stream = StandardAesDecrypt::new(&key, &iv, Box::new(std::io::Cursor::new(ciphertext_padded.clone())));
+        let mut read_stream = std::io::Cursor::new(ciphertext_padded.clone());
+        let mut decrypt_transform = StandardAesDecrypt::new(&key, &iv);
+        let mut decrypt_stream = TransformRead::new(&mut read_stream, &mut decrypt_transform);
         let mut decrypt_result = Vec::new();
         decrypt_stream.read_to_end(&mut decrypt_result);
         assert_eq!(&plaintext[0..], &decrypt_result[0..]);
@@ -320,11 +330,15 @@ pub mod test {
         // 44 bytes (more than one block and not divisible by 16)
         let plaintext = memutil::hex_to_bytes(b"f69f2445df4f9b17ad2b417be66c37109da71b2378a854f670ed165bac3dbc4814f4da5f00a08772b63c6a04");
 
-        let mut encrypt_stream = StandardAesEncrypt::new(&key, &iv, Box::new(std::io::Cursor::new(plaintext.clone())));
+        let mut read_stream = std::io::Cursor::new(plaintext.clone());
+        let mut encrypt_transform = StandardAesEncrypt::new(&key, &iv);
+        let mut encrypt_stream = TransformRead::new(&mut read_stream, &mut encrypt_transform);
         let mut encrypt_result = Vec::new();
         encrypt_stream.read_to_end(&mut encrypt_result);
 
-        let mut decrypt_stream = StandardAesDecrypt::new(&key, &iv, Box::new(std::io::Cursor::new(encrypt_result)));
+        let mut read_stream = std::io::Cursor::new(encrypt_result);
+        let mut decrypt_transform = StandardAesDecrypt::new(&key, &iv);
+        let mut decrypt_stream = TransformRead::new(&mut read_stream, &mut decrypt_transform);
         let mut decrypt_result = Vec::new();
         decrypt_stream.read_to_end(&mut decrypt_result);
         assert_eq!(&plaintext[0..], &decrypt_result[0..]);
