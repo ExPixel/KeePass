@@ -11,6 +11,7 @@ use crate::ioutil::{self, StoredReadRef};
 use crate::crypto::kdf;
 use crate::crypto::crs::CrsAlgorithm;
 use crate::crypto::cipher::{CipherEngine, TransformRead};
+use crate::crypto::hashed_block_stream::HashedBlockRead;
 use crate::cryptoutil;
 
 use super::*;
@@ -25,6 +26,7 @@ pub struct Kdbx {
     inner_random_stream_algorithm: CrsAlgorithm,
     hash_of_header: ProtectedBinary,
     hash_of_file_on_disk: ProtectedBinary,
+    binaries: Vec<ProtectedBinary>,
 }
 
 impl Kdbx {
@@ -39,6 +41,7 @@ impl Kdbx {
             inner_random_stream_algorithm: CrsAlgorithm::None,
             hash_of_header: ProtectedBinary::empty(),
             hash_of_file_on_disk: ProtectedBinary::empty(),
+            binaries: Vec::new(),
         }
     }
 
@@ -120,12 +123,13 @@ pub fn load_kdbx<R: Read>(input: &mut R, database: &mut PwDatabase) -> Result<()
         let mut decrypt_stream = TransformRead::new(&mut input, &mut *decrypt_transform);
 
         let mut start_stream_bytes = [0u8; 32];
-        decrypt_stream.read_exact(&mut start_stream_bytes[0..]).map_err(|e| Error::IO(e))?;
-        if start_stream_bytes != &kdbx.stream_start_bytes[0..] {
+        decrypt_stream.read_exact(&mut start_stream_bytes[0..32]).map_err(|e| Error::IO(e))?;
+        if start_stream_bytes != &kdbx.stream_start_bytes[0..32] {
             return Err(Error::BadFormat("File corrupted (bad start bytes)"));
         }
-
-        load_kdbx_unencrypted(&mut decrypt_stream, database, &kdbx)?;
+        let mut block_stream = HashedBlockRead::new(&mut decrypt_stream, true);
+        // load_inner_header(&mut block_stream, database, &mut kdbx)?;
+        load_kdbx_unencrypted(&mut block_stream, database, &kdbx)?;
     } else {
         // KDBX >= 4
         unimplemented!("kdbx.version >= 4 decryption no yet implemented");
@@ -156,9 +160,73 @@ pub fn load_kdbx_unencrypted<R: Read>(input: &mut R, database: &mut PwDatabase, 
 }
 
 fn load_inner_header<R: Read>(input: &mut R, database: &mut PwDatabase, kdbx: &mut Kdbx) -> Result<(), Error> {
+    let mut buffer: Vec<u8> = Vec::with_capacity(32);
+    loop {
+        if !read_inner_header_field(input, database, kdbx, &mut buffer)? {
+            break
+        }
+    }
     Ok(())
 }
 
+fn read_inner_header_field<R: Read>(input: &mut R, database: &mut PwDatabase, kdbx: &mut Kdbx, buffer: &mut Vec<u8>) -> Result<bool, Error> {
+    let field_id = ioutil::io_read_u8(input)?;
+    let size = ioutil::io_read_i32(input)?;
+
+    println!("INNER HEADER ITEM: {}, {} ({})", field_id, size, size as usize);
+
+    if size < 0 {
+        return Err(Error::BadFormat("File Corrupted (inner header field size)"));
+    } else {
+        buffer.resize(size as usize, 0);
+        input.read_exact(&mut buffer[0..(size as usize)]).map_err(|e| Error::IO(e))?;
+    }
+
+    let data = &buffer[0..(size as usize)];
+
+    let mut result = true;
+
+    match KdbxInnerHeaderFieldID::from_bits(field_id) {
+        Some(KdbxInnerHeaderFieldID::EndOfHeader) => {
+            result = false; // returning false indicates the end of the header
+        },
+
+        Some(KdbxInnerHeaderFieldID::InnerRandomStreamID) => {
+            if data.len() < 4 {
+                return Err(Error::BadFormat("Invalid Compression Algorithm"));
+            } else {
+                let compression_algorithm_id = memutil::bytes_to_u32(data);
+                if let Some(compression_algorithm) = PwCompressionAlgorithm::from_int(compression_algorithm_id) {
+                    debug_println!("Set database compression algorithm. (inner header)");
+                    database.compression_algorithm = compression_algorithm;
+                } else {
+                    return Err(Error::BadFormat("Invalid compression algorithm."));
+                }
+            }
+        },
+
+        Some(KdbxInnerHeaderFieldID::InnerRandomStreamKey) => {
+            kdbx.inner_random_stream_key = ProtectedBinary::copy_slice(data);
+            debug_println!("Set InnerRandomStreamKey. (inner header)");
+            database.context.crypto_random.add_entropy(data);
+        },
+
+        Some(KdbxInnerHeaderFieldID::Binary) => {
+            debug_println!("Added binary with length: {}", data.len());
+            kdbx.binaries.push(ProtectedBinary::copy_slice(data));
+        },
+
+        Some(_) => {
+            debug_println!("Unhandled Known Inner Header ID: {:b}", field_id);
+        },
+
+        _ => {
+            debug_println!("Unknown Inner Header ID: {:b}", field_id);
+        }
+    }
+
+    Ok(result)
+}
 
 fn load_header<R: Read>(input: &mut R, database: &mut PwDatabase, kdbx: &mut Kdbx) -> Result<(), Error> {
     let sig1 = ioutil::io_read_u32(input)?;
@@ -180,7 +248,7 @@ fn load_header<R: Read>(input: &mut R, database: &mut PwDatabase, kdbx: &mut Kdb
     }
     kdbx.version = version;
 
-    let mut buffer: Vec<u8> = Vec::with_capacity(16);
+    let mut buffer: Vec<u8> = Vec::with_capacity(32);
 
     loop {
         if !read_header_field(input, database, kdbx, &mut buffer)? {
@@ -197,13 +265,13 @@ fn read_header_field<R: Read>(input: &mut R, database: &mut PwDatabase, kdbx: &m
     let size: i32;
 
     if kdbx.version < FILE_VERSION_32_4 {
-        size = ioutil::io_read_i16(input)? as i32;
+        size = ioutil::io_read_u16(input)? as i32;
     } else {
         size = ioutil::io_read_i32(input)?;
     }
 
     if size < 0 {
-        return Err(Error::BadFormat("File Corrupted"));
+        return Err(Error::BadFormat("File Corrupted (outer header field size)"));
     } else if size > 0 {
         buffer.resize(size as usize, 0);
         input.read_exact(&mut buffer[0..(size as usize)]).map_err(|e| Error::IO(e))?;
@@ -277,6 +345,7 @@ fn read_header_field<R: Read>(input: &mut R, database: &mut PwDatabase, kdbx: &m
         Some(KdbxHeaderFieldID::InnerRandomStreamKey) => {
             debug_assert!(kdbx.version < FILE_VERSION_32_4, "New KDBX file is using parameter `InnerRandomStreamKey` from legacy KDBX versions.");
             kdbx.inner_random_stream_key = ProtectedBinary::copy_slice(data);
+            database.context.crypto_random.add_entropy(data);
             debug_println!("Set InnerRandomStreamKey.");
         },
 
