@@ -10,7 +10,7 @@ use crate::database::{PwDatabase, PwUUID, PwCompressionAlgorithm};
 use crate::memutil::{self, ProtectedBinary};
 use crate::ioutil::{self, StoredReadRef};
 use crate::crypto::kdf;
-use crate::crypto::crs::CrsAlgorithm;
+use crate::crypto::crypto_random_stream::CrsAlgorithm;
 use crate::crypto::cipher::{CipherEngine, TransformRead};
 use crate::crypto::hashed_block_stream::HashedBlockRead;
 use crate::cryptoutil;
