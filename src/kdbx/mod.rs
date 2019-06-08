@@ -4,6 +4,7 @@ pub mod write;
 pub use self::read::*;
 pub use self::write::*;
 
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub enum KdbxFormat {
     /// The default, encrypted file format.
     Default = 0,

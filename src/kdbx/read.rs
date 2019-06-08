@@ -18,6 +18,7 @@ use crate::cryptoutil;
 use super::*;
 
 pub struct Kdbx {
+    format: KdbxFormat,
     signature: (u32, u32),
     version: u32,
     master_seed: ProtectedBinary,
@@ -33,6 +34,7 @@ pub struct Kdbx {
 impl Kdbx {
     pub fn new() -> Kdbx {
         Kdbx {
+            format: KdbxFormat::Default,
             signature: (0, 0),
             version: 0,
             master_seed: ProtectedBinary::empty(),
@@ -81,16 +83,21 @@ impl Kdbx {
 }
 
 
-pub fn load_kdbx_file<PathRef: AsRef<Path>>(p: PathRef, database: &mut PwDatabase) -> Result<(), Error> {
+pub fn load_kdbx_file<PathRef: AsRef<Path>>(p: PathRef, format: KdbxFormat, database: &mut PwDatabase) -> Result<(), Error> {
     let file = std::fs::File::open(p).map_err(|e| Error::IO(e))?;
     let mut buffered = BufReader::new(file);
-    load_kdbx(&mut buffered, database)
+    load_kdbx(&mut buffered, format, database)
 }
 
-pub fn load_kdbx<R: Read>(input: &mut R, database: &mut PwDatabase) -> Result<(), Error> {
+pub fn load_kdbx<R: Read>(input: &mut R, format: KdbxFormat, database: &mut PwDatabase) -> Result<(), Error> {
     let mut kdbx = Kdbx::new();
 
     let mut input = ioutil::ReadInto::new(input, Sha256::new());
+
+    if format == KdbxFormat::PlainXml {
+        // This is unencrypted so it doesn't contain any of the encryption headers.
+        return load_kdbx_unencrypted(&mut input, database, &mut kdbx);
+    }
 
     let header_data = {
         let mut stored_input = ioutil::StoredReadRef::new(&mut input);
