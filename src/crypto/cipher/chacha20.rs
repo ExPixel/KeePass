@@ -2,6 +2,7 @@ use std::io::Read;
 use crate::database::PwUUID;
 use super::CipherEngine;
 use super::CtrBlockCipher;
+use crate::memutil::read32_le;
 
 use super::Transform;
 
@@ -17,7 +18,7 @@ use super::Transform;
 /// Where "+" denotes integer addition modulo 2^32, "^" denotes a bitwise
 /// Exclusive OR (XOR), and "<<< n" denotes an n-bit left rotation
 /// (towards the high bits).
-#[inline]
+#[inline(always)]
 fn quarter_round(mut a: u32, mut b: u32, mut c: u32, mut d: u32) -> (u32, u32, u32, u32) {
     a = a.wrapping_add(b); d ^= a; d = d.rotate_left(16);
     c = c.wrapping_add(d); b ^= c; b = b.rotate_left(12);
@@ -27,39 +28,28 @@ fn quarter_round(mut a: u32, mut b: u32, mut c: u32, mut d: u32) -> (u32, u32, u
 }
 
 /// Applies a quarter round to a 16 int(32 bits) chacha state.
-#[inline]
+#[inline(always)]
 fn state_quarter_round(state: &mut [u32], idx_a: usize, idx_b: usize, idx_c: usize, idx_d: usize) {
     let (a, b, c, d) = (state[idx_a], state[idx_b], state[idx_c], state[idx_d]);
-    let (a, b, c, d) = quarter_round(a, b, c, d);
-    state[idx_a] = a;
-    state[idx_b] = b;
-    state[idx_c] = c;
-    state[idx_d] = d;
-}
+    let (a, b, c, d) = unsafe {(
+            *state.get_unchecked(idx_a),
+            *state.get_unchecked(idx_b),
+            *state.get_unchecked(idx_c),
+            *state.get_unchecked(idx_d),
+    )};
 
-#[cfg(target_endian = "little")]
-#[inline]
-fn read32_le(bytes: &[u8], index: usize) -> u32 {
-    assert!(index < bytes.len() + 4);
+    let (a, b, c, d) = quarter_round(a, b, c, d);
 
     unsafe {
-        *(bytes.as_ptr().offset(index as isize) as *const u32)
+        *state.get_unchecked_mut(idx_a) = a;
+        *state.get_unchecked_mut(idx_b) = b;
+        *state.get_unchecked_mut(idx_c) = c;
+        *state.get_unchecked_mut(idx_d) = d;
     }
 }
 
-#[cfg(target_endian = "big")]
-#[inline]
-fn read32_le(bytes: &[u8], index: usize) -> u32 {
-    assert!(index < bytes.len() + 4);
-
-    let be = unsafe {
-        *(bytes.as_ptr().offset(index as isize) as *const u32)
-    };
-    be.swap_bytes()
-}
-
 pub struct ChaCha20 {
-    state:          [u32; 16],
+    state: [u32; 16],
 }
 
 impl ChaCha20 {

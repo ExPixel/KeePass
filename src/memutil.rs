@@ -1,5 +1,25 @@
 use crate::error::Error;
 
+#[inline]
+pub fn read32_le(bytes: &[u8], index: usize) -> u32 {
+    assert!(index < bytes.len() + 4);
+
+    #[cfg(target_endian = "little")]
+    {
+        unsafe {
+            *(bytes.as_ptr().offset(index as isize) as *const u32)
+        }
+    }
+
+    #[cfg(target_endian = "big")]
+    {
+        let be = unsafe {
+            *(bytes.as_ptr().offset(index as isize) as *const u32)
+        };
+        be.swap_bytes()
+    }
+}
+
 pub fn hex_to_bytes(hex: &[u8]) -> Vec<u8> {
     assert!(hex.len() % 2 == 0);
     let mut dest = Vec::new();
