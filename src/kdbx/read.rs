@@ -3,6 +3,7 @@ use std::io::BufReader;
 use std::path::Path;
 use xml::reader::{EventReader, XmlEvent};
 use sha2::{Sha256, Sha512, Digest as _};
+use flate2::read::GzDecoder;
 
 use crate::error::{self, Error};
 use crate::database::{PwDatabase, PwUUID, PwCompressionAlgorithm};
@@ -122,14 +123,21 @@ pub fn load_kdbx<R: Read>(input: &mut R, database: &mut PwDatabase) -> Result<()
         let mut decrypt_transform = cipher_engine.decrypt_stream(cipherkey, cipheriv);
         let mut decrypt_stream = TransformRead::new(&mut input, &mut *decrypt_transform);
 
+        // Check that the decryption was successful by checking the first 32 bytes:
         let mut start_stream_bytes = [0u8; 32];
         decrypt_stream.read_exact(&mut start_stream_bytes[0..32]).map_err(|e| Error::IO(e))?;
         if start_stream_bytes != &kdbx.stream_start_bytes[0..32] {
             return Err(Error::BadFormat("File corrupted (bad start bytes)"));
         }
         let mut block_stream = HashedBlockRead::new(&mut decrypt_stream, true);
-        // load_inner_header(&mut block_stream, database, &mut kdbx)?;
-        load_kdbx_unencrypted(&mut block_stream, database, &kdbx)?;
+
+        match database.compression_algorithm {
+            PwCompressionAlgorithm::None => load_kdbx_unencrypted(&mut block_stream, database, &kdbx)?,
+            PwCompressionAlgorithm::GZip => {
+                let mut gz_decode_stream = GzDecoder::new(&mut block_stream);
+                load_kdbx_unencrypted(&mut gz_decode_stream, database, &kdbx)?
+            },
+        }
     } else {
         // KDBX >= 4
         unimplemented!("kdbx.version >= 4 decryption no yet implemented");
@@ -192,17 +200,13 @@ fn read_inner_header_field<R: Read>(input: &mut R, database: &mut PwDatabase, kd
         },
 
         Some(KdbxInnerHeaderFieldID::InnerRandomStreamID) => {
-            if data.len() < 4 {
-                return Err(Error::BadFormat("Invalid Compression Algorithm"));
+            let stream_id = memutil::bytes_to_u32(data);
+            if let Some(alg) = CrsAlgorithm::from_int(stream_id) {
+                kdbx.inner_random_stream_algorithm = alg;
             } else {
-                let compression_algorithm_id = memutil::bytes_to_u32(data);
-                if let Some(compression_algorithm) = PwCompressionAlgorithm::from_int(compression_algorithm_id) {
-                    debug_println!("Set database compression algorithm. (inner header)");
-                    database.compression_algorithm = compression_algorithm;
-                } else {
-                    return Err(Error::BadFormat("Invalid compression algorithm."));
-                }
+                return Err(Error::BadFormat("Unknown stream cipher algorithm."));
             }
+            debug_println!("Set InnerRandomStreamID. (inner header)");
         },
 
         Some(KdbxInnerHeaderFieldID::InnerRandomStreamKey) => {
