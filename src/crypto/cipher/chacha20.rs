@@ -3,6 +3,8 @@ use crate::database::PwUUID;
 use super::{BlockCipher, CtrBlockCipher, CtrBlockCipher64, Transform, CipherEngine};
 use crate::memutil::read32_le;
 
+pub type ChaCha20Ctr = CtrBlockCipher64<ChaCha20>;
+
 const SIGMA: [u32; 4] = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574];
 
 pub struct ChaCha20 {
@@ -15,6 +17,10 @@ impl ChaCha20 {
         let mut chacha = ChaCha20::new(key, nonce);
         chacha.state[12] = 1;
         return chacha;
+    }
+
+    pub fn new_ctr(key: &[u8], nonce: &[u8]) -> ChaCha20Ctr {
+        CtrBlockCipher64::new(ChaCha20::new(key, nonce))
     }
 
     pub fn new(key: &[u8], nonce: &[u8]) -> ChaCha20 {

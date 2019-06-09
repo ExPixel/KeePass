@@ -68,7 +68,7 @@ impl<'r> HashedBlockRead<'r> {
         }
 
         self.buffer.resize(len, 0);
-        self.inner.read_exact(&mut self.buffer);
+        self.inner.read_exact(&mut self.buffer)?;
 
         if self.verify {
             let mut hasher = Sha256::new();

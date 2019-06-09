@@ -258,7 +258,7 @@ pub mod aes {
         let mut hasher = Sha256::new();
         hasher.input(&new_key);
 
-        /// I just overwrite the new_key array with the hashed value.
+        // I just overwrite the new_key array with the hashed value.
         new_key.copy_from_slice(&hasher.result());
         Ok((new_key))
     }
@@ -364,7 +364,7 @@ mod test {
         ];
         let mut data = [0u8; 16];
         data[0] = 0x04;
-        aes::encrypt256(&key, &mut data, 1);
+        aes::transform_key_256(&mut data, &key, 1);
         assert_eq!(reference, data, "bad AES encryption");
     }
 }

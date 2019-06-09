@@ -1,6 +1,8 @@
 use std::io::Read;
-use super::BlockCipher;
+use super::{CtrBlockCipher64, BlockCipher};
 use crate::memutil::read32_le;
+
+pub type Salsa20Ctr = CtrBlockCipher64<Salsa20>;
 
 const SIGMA: [u32; 4] = [0x61707865, 0x3320646E, 0x79622D32, 0x6B206574];
 
@@ -32,6 +34,10 @@ impl Salsa20 {
                 SIGMA[3],
             ],
         }
+    }
+
+    pub fn new_ctr(key: &[u8], nonce: &[u8]) -> Salsa20Ctr {
+        CtrBlockCipher64::new(Salsa20::new(key, nonce))
     }
 }
 
