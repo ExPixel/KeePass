@@ -2,7 +2,6 @@ use super::Transform;
 use std::io::Read;
 use crate::database::PwUUID;
 use super::CipherEngine;
-use super::CtrBlockCipher;
 use aes::Aes256;
 use block_modes::block_padding::Pkcs7;
 use block_modes::block_padding::Padding as _;

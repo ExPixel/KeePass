@@ -1,52 +1,9 @@
 use std::io::Read;
 use crate::database::PwUUID;
-use super::CipherEngine;
-use super::CtrBlockCipher;
+use super::{BlockCipher, CtrBlockCipher, CtrBlockCipher64, Transform, CipherEngine};
 use crate::memutil::read32_le;
 
-use super::Transform;
-
-/// The basic operation of the ChaCha algorithm is the quarter round.  It
-/// operates on four 32-bit unsigned integers, denoted a, b, c, and d.
-/// The operation is as follows (in C-like notation):
-///
-/// 1.  a += b; d ^= a; d <<<= 16;
-/// 2.  c += d; b ^= c; b <<<= 12;
-/// 3.  a += b; d ^= a; d <<<= 8;
-/// 4.  c += d; b ^= c; b <<<= 7;
-///
-/// Where "+" denotes integer addition modulo 2^32, "^" denotes a bitwise
-/// Exclusive OR (XOR), and "<<< n" denotes an n-bit left rotation
-/// (towards the high bits).
-#[inline(always)]
-fn quarter_round(mut a: u32, mut b: u32, mut c: u32, mut d: u32) -> (u32, u32, u32, u32) {
-    a = a.wrapping_add(b); d ^= a; d = d.rotate_left(16);
-    c = c.wrapping_add(d); b ^= c; b = b.rotate_left(12);
-    a = a.wrapping_add(b); d ^= a; d = d.rotate_left( 8);
-    c = c.wrapping_add(d); b ^= c; b = b.rotate_left( 7);
-    return (a, b, c, d);
-}
-
-/// Applies a quarter round to a 16 int(32 bits) chacha state.
-#[inline(always)]
-fn state_quarter_round(state: &mut [u32], idx_a: usize, idx_b: usize, idx_c: usize, idx_d: usize) {
-    let (a, b, c, d) = (state[idx_a], state[idx_b], state[idx_c], state[idx_d]);
-    let (a, b, c, d) = unsafe {(
-            *state.get_unchecked(idx_a),
-            *state.get_unchecked(idx_b),
-            *state.get_unchecked(idx_c),
-            *state.get_unchecked(idx_d),
-    )};
-
-    let (a, b, c, d) = quarter_round(a, b, c, d);
-
-    unsafe {
-        *state.get_unchecked_mut(idx_a) = a;
-        *state.get_unchecked_mut(idx_b) = b;
-        *state.get_unchecked_mut(idx_c) = c;
-        *state.get_unchecked_mut(idx_d) = d;
-    }
-}
+const SIGMA: [u32; 4] = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574];
 
 pub struct ChaCha20 {
     state: [u32; 16],
@@ -67,7 +24,7 @@ impl ChaCha20 {
         ChaCha20 {
             state: [
                 // ChaCha20 Constants
-                0x61707865, 0x3320646e, 0x79622d32, 0x6b206574,
+                SIGMA[0], SIGMA[1], SIGMA[2], SIGMA[3],
 
                 // Key
                 read32_le(key,  0), read32_le(key,  4),
@@ -85,9 +42,20 @@ impl ChaCha20 {
             ],
         }
     }
+}
 
-    pub fn next_block(&mut self, dest: &mut [u8]) {
+impl BlockCipher for ChaCha20 {
+    fn next_block(&mut self, dest: &mut [u8]) {
         assert!(dest.len() >= 64, "Dest must be at least 64 bytes in length.");
+
+        macro_rules! quarter_round {
+            ($State:expr, $A:expr, $B:expr, $C:expr, $D:expr) => {
+                $State[$A] = $State[$A].wrapping_add($State[$B]); $State[$D] ^= $State[$A]; $State[$D] = $State[$D].rotate_left(16);
+                $State[$C] = $State[$C].wrapping_add($State[$D]); $State[$B] ^= $State[$C]; $State[$B] = $State[$B].rotate_left(12);
+                $State[$A] = $State[$A].wrapping_add($State[$B]); $State[$D] ^= $State[$A]; $State[$D] = $State[$D].rotate_left( 8);
+                $State[$C] = $State[$C].wrapping_add($State[$D]); $State[$B] ^= $State[$C]; $State[$B] = $State[$B].rotate_left( 7);
+            }
+        }
 
         let mut working_state = unsafe {
             std::slice::from_raw_parts_mut(dest.as_mut_ptr() as *mut u32, 16)
@@ -116,14 +84,14 @@ impl ChaCha20 {
         // machine languages, this is called carryless addition on a 32-bit
         // word.
         for _ in 0..10 {
-            state_quarter_round(&mut working_state, 0, 4, 8,12);
-            state_quarter_round(&mut working_state, 1, 5, 9,13);
-            state_quarter_round(&mut working_state, 2, 6,10,14);
-            state_quarter_round(&mut working_state, 3, 7,11,15);
-            state_quarter_round(&mut working_state, 0, 5,10,15);
-            state_quarter_round(&mut working_state, 1, 6,11,12);
-            state_quarter_round(&mut working_state, 2, 7, 8,13);
-            state_quarter_round(&mut working_state, 3, 4, 9,14);
+            quarter_round!(working_state, 0, 4, 8,12);
+            quarter_round!(working_state, 1, 5, 9,13);
+            quarter_round!(working_state, 2, 6,10,14);
+            quarter_round!(working_state, 3, 7,11,15);
+            quarter_round!(working_state, 0, 5,10,15);
+            quarter_round!(working_state, 1, 6,11,12);
+            quarter_round!(working_state, 2, 7, 8,13);
+            quarter_round!(working_state, 3, 4, 9,14);
         }
 
         for idx in 0..self.state.len() {
@@ -143,19 +111,6 @@ impl ChaCha20 {
             for word in working_state.iter_mut() {
                 *word = (*word).swap_bytes();
             }
-        }
-    }
-}
-
-impl CtrBlockCipher for ChaCha20 {
-    fn apply_keystream(&mut self, data: &mut [u8]) {
-        let mut idx = 0;
-        let mut block = [0u8; 64];
-
-        while idx < data.len() {
-            self.next_block(&mut block);
-            crate::memutil::xor_slices(&mut data[idx..], &block); // This will automatically trim the slices.
-            idx += block.len();
         }
     }
 }
@@ -195,110 +150,21 @@ impl CipherEngine for ChaCha20Engine {
     }
 
     fn encrypt_stream(&self, key: &[u8], iv: &[u8]) -> Box<Transform> {
-        Box::new(ChaCha20Encrypt::new(ChaCha20::new(key, iv)))
+        Box::new(CtrBlockCipher64::new(ChaCha20::new(key, iv)))
     }
 
     fn decrypt_stream(&self, key: &[u8], iv: &[u8]) -> Box<Transform> {
         // decrypt is the same as encrypt
-        Box::new(ChaCha20Encrypt::new(ChaCha20::new(key, iv)))
+        Box::new(CtrBlockCipher64::new(ChaCha20::new(key, iv)))
     }
 }
 
-/// This is used both for encryption and decryption.
-struct ChaCha20Encrypt {
-    /// ChaCha20 instance used for encryption.
-    chacha: ChaCha20,
-
-    /// Buffer containing data that has already been encrypted.
-    /// This buffer is also used to temporarily hold unencrypted data while reading.
-    buffer: [u8; 64],
-
-    /// The current location in the buffer.
-    cursor: usize,
-
-    /// The amount of data currently available in the buffer.
-    buflen: usize,
-}
-
-impl ChaCha20Encrypt {
-    pub fn new(chacha: ChaCha20) -> ChaCha20Encrypt {
-        ChaCha20Encrypt {
-            chacha: chacha,
-            buffer: [0u8; 64],
-            cursor: 0,
-            buflen: 0,
-        }
-    }
-}
-
-impl Transform for ChaCha20Encrypt {
-    fn transform(&mut self, stream: &mut Read, buf: &mut [u8]) -> std::io::Result<usize> {
-        // if all of the data in the buffer has already been read.
-        if self.cursor >= self.buflen {
-            self.cursor = 0;
-            self.buflen = 0;
-
-            // Attempt to fill the buffer before encrypting.
-            while self.buflen < self.buffer.len() {
-                match stream.read(&mut self.buffer[self.buflen..]) {
-                    Ok(0) => {
-                        break; // EOF
-                    },
-                    Ok(read) => {
-                        self.buflen += read;
-                    },
-                    Err(ref err) if err.kind() == std::io::ErrorKind::Interrupted => {
-                        continue; // Non-fatal error, retry.
-                    },
-                    Err(err) => {
-                        return Err(err)
-                    },
-                }
-            }
-
-            if self.buflen == 0 {
-                return Ok(0); // Nothing left to encrypt.
-            }
-
-            // Must make sure that we are always passing a buffer with a length of 64 bytes here
-            // until the very end so that pieces of the ChaCha encryption blocks aren't thrown away.
-            self.chacha.apply_keystream(&mut self.buffer[0..self.buflen]);
-        }
-
-        let minlen = std::cmp::min(buf.len(), self.buflen - self.cursor);
-        (&mut buf[0..minlen]).copy_from_slice(&self.buffer[self.cursor..(self.cursor+minlen)]);
-        self.cursor += minlen;
-
-        Ok(minlen)
-    }
-}
-
-impl Drop for ChaCha20Encrypt {
-    fn drop(&mut self) {
-        crate::memutil::zero_slice(&mut self.buffer);
-    }
-}
 
 
 #[cfg(test)]
 mod test {
-    use super::super::TransformRead;
+    use super::super::{CtrBlockCipher as _, CtrBlockCipher64, TransformRead};
     use super::*;
-
-    #[test]
-    fn chacha20_quarter_round_test() {
-        let a = 0x11111111;
-        let b = 0x01020304;
-        let c = 0x9b8d6f43;
-        let d = 0x01234567;
-
-        let (a, b, c, d) = quarter_round(a, b, c, d);
-
-        assert_eq!(a, 0xea2a92f4);
-        assert_eq!(b, 0xcb1cf8ce);
-        assert_eq!(c, 0x4581472e);
-        assert_eq!(d, 0x5881c4bb);
-    }
 
     #[test]
     fn chacha20_test() {
@@ -363,7 +229,7 @@ mod test {
             0x87, 0x4d,
         ];
 
-        let mut chacha = ChaCha20::with_block_count(1, &test_key, &test_nonce);
+        let mut chacha = CtrBlockCipher64::new(ChaCha20::with_block_count(1, &test_key, &test_nonce));
         let mut test_result = test_plaintext.clone();
         chacha.apply_keystream(&mut test_result);
         assert_eq!(&test_expected[0..], &test_result[0..]);
@@ -408,9 +274,8 @@ mod test {
         ];
 
         let mut stream = std::io::Cursor::new(&test_plaintext[0..]);
-        let mut chacha = ChaCha20::with_block_count(1, &test_key, &test_nonce);
-        let mut transform = ChaCha20Encrypt::new(chacha);
-        let mut stream_encrypt = TransformRead::new(&mut stream, &mut transform);
+        let mut chacha = CtrBlockCipher64::new(ChaCha20::with_block_count(1, &test_key, &test_nonce));
+        let mut stream_encrypt = TransformRead::new(&mut stream, &mut chacha);
         let mut test_result = Vec::new();
         stream_encrypt.read_to_end(&mut test_result);
         assert_eq!(&test_expected[0..], &test_result[0..]);
