@@ -8,6 +8,7 @@ use block_modes::block_padding::Padding as _;
 use aes::block_cipher_trait::generic_array::GenericArray;
 use aes::block_cipher_trait::BlockCipher;
 use crate::memutil;
+use crate::error::Error;
 
 
 pub const AES_KEY_SIZE: usize = 32;
@@ -118,7 +119,8 @@ impl Transform for StandardAesEncrypt {
 
             if self.done {
                 if self.buflen < AES_BLOCK_SIZE {
-                    Pkcs7::pad_block(&mut self.buffer[0..AES_BLOCK_SIZE], self.buflen);
+                    Pkcs7::pad_block(&mut self.buffer[0..AES_BLOCK_SIZE], self.buflen)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, Error::Generic("AES Error")))?;
 
                     memutil::xor_slices(&mut self.buffer[0..AES_BLOCK_SIZE], &iv);
 
@@ -126,7 +128,8 @@ impl Transform for StandardAesEncrypt {
                     self.aes.encrypt_block(&mut gbuf);
                     self.buflen = AES_BLOCK_SIZE;
                 } else {
-                    Pkcs7::pad_block(&mut self.buffer[AES_BLOCK_SIZE..], 0);
+                    Pkcs7::pad_block(&mut self.buffer[AES_BLOCK_SIZE..], 0)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, Error::Generic("AES Error")))?;
 
                     memutil::xor_slices(&mut self.buffer[0..AES_BLOCK_SIZE], &iv);
 

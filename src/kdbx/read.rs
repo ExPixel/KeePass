@@ -1,16 +1,17 @@
 use std::io::prelude::*;
 use std::io::BufReader;
 use std::path::Path;
-use xml::reader::{EventReader, XmlEvent};
 use sha2::{Sha256, Sha512, Digest as _};
 use flate2::read::GzDecoder;
+use xml::reader::{EventReader, XmlEvent};
 
 use crate::error::{self, Error};
 use crate::database::{PwDatabase, PwUUID, PwCompressionAlgorithm};
-use crate::memutil::{self, ProtectedBinary};
+use crate::memutil;
+use crate::security::{ProtectedBinary, XorredBuffer};
 use crate::ioutil::{self, StoredReadRef};
 use crate::crypto::kdf;
-use crate::crypto::crypto_random_stream::CrsAlgorithm;
+use crate::crypto::crypto_random_stream::{CrsAlgorithm, CryptoRandomStream};
 use crate::crypto::cipher::{CipherEngine, TransformRead};
 use crate::crypto::hashed_block_stream::HashedBlockRead;
 use crate::cryptoutil;
@@ -25,6 +26,7 @@ pub struct Kdbx {
     encryption_iv: ProtectedBinary,
     inner_random_stream_key: ProtectedBinary,
     stream_start_bytes: ProtectedBinary,
+    random_stream: CryptoRandomStream,
     inner_random_stream_algorithm: CrsAlgorithm,
     hash_of_header: ProtectedBinary,
     hash_of_file_on_disk: ProtectedBinary,
@@ -45,6 +47,7 @@ impl Kdbx {
             hash_of_header: ProtectedBinary::empty(),
             hash_of_file_on_disk: ProtectedBinary::empty(),
             binaries: Vec::new(),
+            random_stream: CryptoRandomStream::new(CrsAlgorithm::None, &[0]),
         }
     }
 
@@ -127,6 +130,7 @@ pub fn load_kdbx<R: Read>(input: &mut R, format: KdbxFormat, database: &mut PwDa
     if kdbx.version < FILE_VERSION_32_4 {
         // KDBX < 4
 
+        kdbx.random_stream = CryptoRandomStream::new(kdbx.inner_random_stream_algorithm, &kdbx.inner_random_stream_key);
         let mut decrypt_transform = cipher_engine.decrypt_stream(cipherkey, cipheriv);
         let mut decrypt_stream = TransformRead::new(&mut input, &mut *decrypt_transform);
 
@@ -139,10 +143,10 @@ pub fn load_kdbx<R: Read>(input: &mut R, format: KdbxFormat, database: &mut PwDa
         let mut block_stream = HashedBlockRead::new(&mut decrypt_stream, true);
 
         match database.compression_algorithm {
-            PwCompressionAlgorithm::None => load_kdbx_unencrypted(&mut block_stream, database, &kdbx)?,
+            PwCompressionAlgorithm::None => load_kdbx_unencrypted(&mut block_stream, database, &mut kdbx)?,
             PwCompressionAlgorithm::GZip => {
                 let mut gz_decode_stream = GzDecoder::new(&mut block_stream);
-                load_kdbx_unencrypted(&mut gz_decode_stream, database, &kdbx)?
+                load_kdbx_unencrypted(&mut gz_decode_stream, database, &mut kdbx)?
             },
         }
     } else {
@@ -154,24 +158,160 @@ pub fn load_kdbx<R: Read>(input: &mut R, format: KdbxFormat, database: &mut PwDa
     Ok(())
 }
 
-pub fn load_kdbx_unencrypted<R: Read>(input: &mut R, database: &mut PwDatabase, kdbx: &Kdbx) -> Result<(), Error> {
-    let parser = EventReader::new(input);
+#[derive(Debug, Clone, Copy)]
+enum KdbContext {
+    Null,
+    KeePassFile,
+    Meta,
+    Root,
+    MemoryProtection,
+    CustomIcons,
+    CustomIcon,
+    Binaries,
+    CustomData,
+    CustomDataItem,
+    RootDeletedObjects,
+    DeletedObject,
+    Group,
+    GroupTimes,
+    GroupCustomData,
+    GroupCustomDataItem,
+    Entry,
+    EntryTimes,
+    EntryString,
+    EntryBinary,
+    EntryAutoType,
+    EntryAutoTypeItem,
+    EntryHistory,
+    EntryCustomData,
+    EntryCustomDataItem
+}
 
-    for evt in parser {
-        match evt {
-            Ok(XmlEvent::StartElement { name, .. }) => {
-                println!("start-element: {}", name);
+struct XmlStartElement {
+    name: xml::name::OwnedName,
+    attributes: Vec<xml::attribute::OwnedAttribute>,
+}
+
+struct XmlEndElement {
+    name: xml::name::OwnedName,
+}
+
+pub fn load_kdbx_unencrypted<R: Read>(input: &mut R, database: &mut PwDatabase, kdbx: &mut Kdbx) -> Result<(), Error> {
+    let mut ctx = KdbContext::Null;
+    let mut xml = EventReader::new(input);
+    loop {
+        let event = match xml.next() {
+            Ok(event_ok) => event_ok,
+            Err(event_err) => {
+                return Err(Error::XmlError);
+            },
+        };
+
+        match event {
+            XmlEvent::StartElement { name, attributes, .. } => {
+                ctx = read_start_xml_element(kdbx, ctx, &mut xml, XmlStartElement { name, attributes })?;
+            },
+
+            _ => {
+                return Err(Error::BadFormat("Unexpected XML element."));
             }
-
-            Ok(XmlEvent::EndElement { name }) => {
-                println!("end-element: {}", name);
-            }
-
-            _ => {}
         }
     }
 
+    // @TODO assert that the context is null at the end of the loop
+
     Ok(())
+}
+
+fn read_start_xml_element<R: Read>(kdbx: &mut Kdbx, ctx: KdbContext, xml: &mut EventReader<R>, elem: XmlStartElement) -> Result<KdbContext, Error> {
+    match ctx {
+        _ => {
+            return Err(Error::Generic("Unhandled XML Context"));
+        }
+    }
+}
+
+fn xml_read_text<R: Read>(xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<String, Error> {
+    let mut depth = 0;
+    loop {
+        let event = match xml.next() {
+            Ok(event_ok) => event_ok,
+            Err(event_err) => {
+                return Err(Error::XmlError);
+            },
+        };
+
+        match event {
+            XmlEvent::StartElement {..} => {
+                depth += 1;
+            },
+
+            XmlEvent::EndElement {..} => {
+                if depth == 0 {
+                    return Ok(String::new());
+                }
+                depth -= 1;
+            },
+
+            XmlEvent::Characters(text) => {
+                return Ok(text);
+            }
+
+            XmlEvent::EndDocument => {
+                return Err(Error::BadFormat("Unexpected end of XML document."));
+            }
+
+            _ => { /* NOP */ }
+        }
+    }
+}
+
+fn xml_read_string_raw<R: Read>(xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<String, Error> {
+    xml_read_text(xml, elem)
+}
+
+fn xml_read_string<R: Read>(kdbx: &mut Kdbx, xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<String, Error> {
+    if let Some(xb) = xml_process_node(kdbx, xml, elem)? {
+        let mut plaintext = Vec::new();
+        xb.plaintext_vec(&mut plaintext);
+        String::from_utf8(plaintext).map_err(|e| Error::BadFormat("Invalid UTF8 string."))
+    } else {
+        xml_read_text(xml, elem)
+    }
+}
+
+fn xml_read_base64<R: Read>(kdbx: &mut Kdbx, xml: &mut EventReader<R>, elem: &XmlStartElement, raw: bool) -> Result<Vec<u8>, Error> {
+    let s = if raw {
+        xml_read_string_raw(xml, elem)?
+    } else {
+        xml_read_string(kdbx, xml, elem)?
+    };
+
+    if s.len() == 0 {
+        Ok(Vec::new())
+    } else {
+        base64::decode(s.as_bytes()).map_err(|e| Error::BadFormat("Invalid Base64 data."))
+    }
+}
+
+fn xml_process_node<R: Read>(kdbx: &mut Kdbx, xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<Option<XorredBuffer>, Error> {
+    let mut protected = false;
+    for attr in elem.attributes.iter() {
+        if attr.name.local_name == ATTR_PROTECTED && attr.value == VAL_TRUE {
+            protected = true;
+            break;
+        }
+    }
+
+    if protected {
+        let mut data = xml_read_base64(kdbx, xml, elem, true)?;
+        let mut dlen = data.len();
+        data.resize(dlen * 2, 0);
+        kdbx.random_stream.get_random_bytes(&mut data[dlen..]);
+        Ok(Some(XorredBuffer::wrap(data)))
+    } else {
+        Ok(None)
+    }
 }
 
 fn load_inner_header<R: Read>(input: &mut R, database: &mut PwDatabase, kdbx: &mut Kdbx) -> Result<(), Error> {

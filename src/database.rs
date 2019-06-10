@@ -1,7 +1,7 @@
 use rand::prelude::*;
 use sha2::{Sha256, Digest};
 use std::collections::HashMap;
-use crate::memutil::{ProtectedString, ProtectedBinary};
+use crate::security::{ProtectedString, ProtectedBinary};
 use crate::vdict::VariantDict;
 use crate::context::Context;
 use crate::crypto::kdf::{KdfParameters};

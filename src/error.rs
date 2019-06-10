@@ -21,6 +21,10 @@ pub enum Error {
 
     /// A KDBX file has some invalid bits in it.
     BadFormat(&'static str),
+
+    // @TODO maybe add the xml error text in here, but that might leak something.
+    /// XML error.
+    XmlError,
 }
 
 impl fmt::Debug for Error {
@@ -48,6 +52,10 @@ impl fmt::Debug for Error {
 
             &Error::BadFormat(desc) => {
                 write!(f, "Error::BadFormat({})", desc)
+            },
+
+            &Error::XmlError => {
+                write!(f, "Error::XmlError")
             },
         }
     }
@@ -78,6 +86,10 @@ impl fmt::Display for Error {
 
             &Error::BadFormat(desc) => {
                 write!(f, "Bad File Format `{}`", desc)
+            },
+
+            &Error::XmlError => {
+                write!(f, "XML Error")
             },
         }
     }

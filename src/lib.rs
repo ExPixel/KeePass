@@ -19,6 +19,7 @@ pub mod context;
 pub mod constants;
 pub mod crypto;
 pub mod cryptoutil;
+pub mod security;
 
 #[cfg(test)]
 mod tests {

@@ -49,6 +49,7 @@ pub enum CryptoRandomStream {
         j: u8,
         state: [u8; 256]
     },
+    None,
 }
 
 impl CryptoRandomStream {
@@ -75,7 +76,7 @@ impl CryptoRandomStream {
                 CryptoRandomStream::new_arc_four_variant(key)
             },
             CrsAlgorithm::None => {
-                panic!("Unsupported CRS Algorithm.");
+                CryptoRandomStream::None
             },
         }
     }
@@ -138,6 +139,10 @@ impl CryptoRandomStream {
                     dest[w] = state[*i as usize].wrapping_add(state[*j as usize]);
                 }
             },
+
+            CryptoRandomStream::None => {
+                panic!("Cannot call get_random_bytes on CryptoRandomStream with no algorithm.");
+            }
         }
     }
 

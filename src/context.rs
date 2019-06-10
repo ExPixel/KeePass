@@ -1,6 +1,7 @@
 use rand::prelude::*;
 use sha2::{Sha256, Digest};
-use crate::memutil::{self, ProtectedBinary};
+use crate::memutil;
+use crate::security::ProtectedBinary;
 
 /// Contains the Globals and Singletons for an open database.
 pub struct Context {
