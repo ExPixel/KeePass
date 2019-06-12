@@ -1,4 +1,5 @@
 use std::io::prelude::*;
+use chrono::prelude::*;
 use std::io::BufReader;
 use std::path::Path;
 use sha2::{Sha256, Sha512, Digest as _};
@@ -31,6 +32,8 @@ pub struct Kdbx {
     hash_of_header: ProtectedBinary,
     hash_of_file_on_disk: ProtectedBinary,
     binaries: Vec<ProtectedBinary>,
+
+    repair_mode: bool,
 }
 
 impl Kdbx {
@@ -48,6 +51,8 @@ impl Kdbx {
             hash_of_file_on_disk: ProtectedBinary::empty(),
             binaries: Vec::new(),
             random_stream: CryptoRandomStream::new(CrsAlgorithm::None, &[0]),
+
+            repair_mode: false,
         }
     }
 
@@ -158,7 +163,7 @@ pub fn load_kdbx<R: Read>(input: &mut R, format: KdbxFormat, database: &mut PwDa
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KdbContext {
     Null,
     KeePassFile,
@@ -198,45 +203,135 @@ struct XmlEndElement {
 
 pub fn load_kdbx_unencrypted<R: Read>(input: &mut R, database: &mut PwDatabase, kdbx: &mut Kdbx) -> Result<(), Error> {
     let mut ctx = KdbContext::Null;
-    let mut xml = EventReader::new(input);
+    let config = xml::ParserConfig::new()
+            .trim_whitespace(true)
+            .ignore_comments(true)
+            .coalesce_characters(true);
+    let mut xml = EventReader::new_with_config(input, config);
+
     loop {
         let event = match xml.next() {
             Ok(event_ok) => event_ok,
-            Err(event_err) => {
+            Err(_) => {
                 return Err(Error::XmlError);
             },
         };
 
         match event {
             XmlEvent::StartElement { name, attributes, .. } => {
-                ctx = read_start_xml_element(kdbx, ctx, &mut xml, XmlStartElement { name, attributes })?;
+                println!("- start element with context: {:?}", ctx);
+                ctx = read_start_xml_element(database, kdbx, ctx, &mut xml, XmlStartElement { name, attributes })?;
             },
-
-            _ => {
+            XmlEvent::EndElement { .. } => {
+                // @TODO handle element close
+            },
+            XmlEvent::StartDocument { .. } => { /* NOP */ }
+            XmlEvent::EndDocument { .. } => { break; }
+            elem => {
+                println!("element: {:?}", elem);
                 return Err(Error::BadFormat("Unexpected XML element."));
             }
         }
     }
 
-    // @TODO assert that the context is null at the end of the loop
+    // @TODO return an error instead.
+    assert_eq!(KdbContext::Null, ctx, "Bad ending context value");
 
     Ok(())
 }
 
-fn read_start_xml_element<R: Read>(kdbx: &mut Kdbx, ctx: KdbContext, xml: &mut EventReader<R>, elem: XmlStartElement) -> Result<KdbContext, Error> {
+fn read_start_xml_element<R: Read>(database: &mut PwDatabase, kdbx: &mut Kdbx, ctx: KdbContext, xml: &mut EventReader<R>, elem: XmlStartElement) -> Result<KdbContext, Error> {
     match ctx {
+        KdbContext::Null => {
+            if elem.name.local_name == ELEM_DOC_NODE {
+                return Ok(KdbContext::KeePassFile);
+            } else {
+                xml_skip_element(xml, &elem)?;
+            }
+        },
+        KdbContext::KeePassFile => {
+            if elem.name.local_name == ELEM_META {
+                return Ok(KdbContext::Meta);
+            } else if elem.name.local_name == ELEM_ROOT {
+                return Ok(KdbContext::Root);
+            } else {
+                xml_skip_element(xml, &elem)?;
+            }
+        },
+        KdbContext::Meta => {
+            match elem.name.local_name.as_str() {
+                ELEM_GENERATOR => xml_skip_element(xml, &elem)?, // ignore
+                ELEM_HEADER_HASH => {
+                    let hash = xml_read_string(kdbx, xml, &elem)?;
+                    if hash.len() > 0 && kdbx.hash_of_header.len() > 0 && !kdbx.repair_mode {
+                        debug_assert!(kdbx.version < FILE_VERSION_32_4);
+                        let hash_bytes = base64::decode(hash.as_bytes()).map_err(|_| Error::BadFormat("Invalid Base64."))?;
+                        if &hash_bytes[0..] != &kdbx.hash_of_header[0..] {
+                            return Err(Error::BadFormat("File corrupted."));
+                        }
+                    }
+                },
+                ELEM_SETTINGS_CHANGED => database.settings_changed = xml_read_time(kdbx, xml, &elem)?,
+                ELEM_DB_NAME => database.name = xml_read_string(kdbx, xml, &elem)?,
+                ELEM_DB_NAME_CHANGED => database.name_changed = xml_read_time(kdbx, xml, &elem)?,
+                ELEM_DB_DESC => database.description = xml_read_string(kdbx, xml, &elem)?,
+                ELEM_DB_DESC_CHANGED => database.description_changed = xml_read_time(kdbx, xml, &elem)?,
+                ELEM_DB_DEFAULT_USER => database.default_username = xml_read_string(kdbx, xml, &elem)?,
+                ELEM_DB_DEFAULT_USER_CHANGED => database.default_username_changed = xml_read_time(kdbx, xml, &elem)?,
+                ELEM_DB_MNTNC_HISTORY_DAYS => database.maintenance_history_days = xml_read_uint(kdbx, xml, &elem)?,
+                _ => {
+                }
+            }
+        },
         _ => {
             return Err(Error::Generic("Unhandled XML Context"));
         }
     }
+    return Ok(ctx);
 }
 
-fn xml_read_text<R: Read>(xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<String, Error> {
+/// Reads until this reads the end of the current element. This will also handle skipping any
+/// any other elements that are encountered first.
+fn xml_skip_element<R: Read>(xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<(), Error> {
+    let mut depth = 0;
+    loop {
+        match xml.next() {
+            Ok(XmlEvent::StartElement { .. }) => {
+                depth += 1;
+            },
+
+            Ok(XmlEvent::EndElement { name, .. }) => {
+                if depth == 0 {
+                    if elem.name == name {
+                        break;
+                    } else {
+                        return Err(Error::XmlError);
+                    }
+                }
+                depth -= 1;
+            },
+
+            Ok(XmlEvent::EndDocument) => {
+                return Err(Error::BadFormat("Unexpected end of XML document."));
+            }
+
+            Err(_) => {
+                return Err(Error::XmlError);
+            },
+
+            _ => { /* NOP */ }
+        }
+    }
+    Ok(())
+}
+
+/// Reads the text contents of an XML element.
+fn xml_read_contents<R: Read>(xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<String, Error> {
     let mut depth = 0;
     loop {
         let event = match xml.next() {
             Ok(event_ok) => event_ok,
-            Err(event_err) => {
+            Err(_) => {
                 return Err(Error::XmlError);
             },
         };
@@ -246,15 +341,20 @@ fn xml_read_text<R: Read>(xml: &mut EventReader<R>, elem: &XmlStartElement) -> R
                 depth += 1;
             },
 
-            XmlEvent::EndElement {..} => {
+            XmlEvent::EndElement { name, .. } => {
                 if depth == 0 {
+                    if name != elem.name {
+                        return Err(Error::XmlError);
+                    }
                     return Ok(String::new());
                 }
                 depth -= 1;
             },
 
             XmlEvent::Characters(text) => {
-                return Ok(text);
+                if depth == 0 {
+                    return Ok(text);
+                }
             }
 
             XmlEvent::EndDocument => {
@@ -266,17 +366,38 @@ fn xml_read_text<R: Read>(xml: &mut EventReader<R>, elem: &XmlStartElement) -> R
     }
 }
 
+fn xml_read_uint<R: Read>(kdbx: &mut Kdbx, xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<u32, Error> {
+    xml_read_string(kdbx, xml, elem)?.parse::<u32>().map_err(|_| Error::BadFormat("Invalid 32-bit integer."))
+}
+
+fn xml_read_time<R: Read>(kdbx: &mut Kdbx, xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<DateTime<Utc>, Error> {
+    if kdbx.format == KdbxFormat::Default && kdbx.version >= FILE_VERSION_32_4 {
+        let b = xml_read_base64(kdbx, xml, elem, false)?;
+        debug_assert!(b.len() == 8, "Expected timestamp to be 8 bytes.");
+        let sec = if b.len() < 8 {
+            let mut b8 = [0u8; 8];
+            (&mut b8[0..b.len()]).copy_from_slice(&b);
+            memutil::bytes_to_i64(&b8)
+        } else {
+            memutil::bytes_to_i64(&b[0..8])
+        };
+        Ok(DateTime::from_utc(NaiveDateTime::from_timestamp(sec, 0), Utc))
+    } else {
+        xml_read_string(kdbx, xml, elem)?.parse::<DateTime<Utc>>().map_err(|_| Error::BadFormat("Invalid DateTime"))
+    }
+}
+
 fn xml_read_string_raw<R: Read>(xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<String, Error> {
-    xml_read_text(xml, elem)
+    xml_read_contents(xml, elem)
 }
 
 fn xml_read_string<R: Read>(kdbx: &mut Kdbx, xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<String, Error> {
     if let Some(xb) = xml_process_node(kdbx, xml, elem)? {
         let mut plaintext = Vec::new();
         xb.plaintext_vec(&mut plaintext);
-        String::from_utf8(plaintext).map_err(|e| Error::BadFormat("Invalid UTF8 string."))
+        String::from_utf8(plaintext).map_err(|_| Error::BadFormat("Invalid UTF8 string."))
     } else {
-        xml_read_text(xml, elem)
+        xml_read_contents(xml, elem)
     }
 }
 
@@ -290,7 +411,7 @@ fn xml_read_base64<R: Read>(kdbx: &mut Kdbx, xml: &mut EventReader<R>, elem: &Xm
     if s.len() == 0 {
         Ok(Vec::new())
     } else {
-        base64::decode(s.as_bytes()).map_err(|e| Error::BadFormat("Invalid Base64 data."))
+        base64::decode(s.as_bytes()).map_err(|_| Error::BadFormat("Invalid Base64 data."))
     }
 }
 
@@ -305,7 +426,7 @@ fn xml_process_node<R: Read>(kdbx: &mut Kdbx, xml: &mut EventReader<R>, elem: &X
 
     if protected {
         let mut data = xml_read_base64(kdbx, xml, elem, true)?;
-        let mut dlen = data.len();
+        let dlen = data.len();
         data.resize(dlen * 2, 0);
         kdbx.random_stream.get_random_bytes(&mut data[dlen..]);
         Ok(Some(XorredBuffer::wrap(data)))
@@ -342,11 +463,11 @@ fn read_inner_header_field<R: Read>(input: &mut R, database: &mut PwDatabase, kd
     let mut result = true;
 
     match KdbxInnerHeaderFieldID::from_bits(field_id) {
-        Some(KdbxInnerHeaderFieldID::EndOfHeader) => {
+        Some(KdbxInnerHeaderFieldID::END_OF_HEADER) => {
             result = false; // returning false indicates the end of the header
         },
 
-        Some(KdbxInnerHeaderFieldID::InnerRandomStreamID) => {
+        Some(KdbxInnerHeaderFieldID::INNER_RANDOM_STREAM_ID) => {
             let stream_id = memutil::bytes_to_u32(data);
             if let Some(alg) = CrsAlgorithm::from_int(stream_id) {
                 kdbx.inner_random_stream_algorithm = alg;
@@ -356,13 +477,13 @@ fn read_inner_header_field<R: Read>(input: &mut R, database: &mut PwDatabase, kd
             debug_println!("Set InnerRandomStreamID. (inner header)");
         },
 
-        Some(KdbxInnerHeaderFieldID::InnerRandomStreamKey) => {
+        Some(KdbxInnerHeaderFieldID::INNER_RANDOM_STREAM_KEY) => {
             kdbx.inner_random_stream_key = ProtectedBinary::copy_slice(data);
             debug_println!("Set InnerRandomStreamKey. (inner header)");
             database.context.crypto_random.add_entropy(data);
         },
 
-        Some(KdbxInnerHeaderFieldID::Binary) => {
+        Some(KdbxInnerHeaderFieldID::BINARY) => {
             debug_println!("Added binary with length: {}", data.len());
             kdbx.binaries.push(ProtectedBinary::copy_slice(data));
         },
@@ -385,7 +506,7 @@ fn load_header<R: Read>(input: &mut R, database: &mut PwDatabase, kdbx: &mut Kdb
     let signature = (sig1, sig2);
 
     if signature == FILE_SIGNATURE_OLD {
-        return Err(Error::OldFormat(error::KEEPASS_VERSION_1x));
+        return Err(Error::OldFormat(error::KEEPASS_VERSION_1X));
     }
 
     if signature != FILE_SIGNATURE && signature != FILE_SIGNATURE_PRE_RELEASE {
@@ -432,11 +553,11 @@ fn read_header_field<R: Read>(input: &mut R, database: &mut PwDatabase, kdbx: &m
 
     let mut result = true;
     match KdbxHeaderFieldID::from_bits(field_id) {
-        Some(KdbxHeaderFieldID::EndOfHeader) => {
+        Some(KdbxHeaderFieldID::END_OF_HEADER) => {
             result = false; // returning false indicates the end of the header
         },
 
-        Some(KdbxHeaderFieldID::CipherID) => {
+        Some(KdbxHeaderFieldID::CIPHER_ID) => {
             if data.len() != crate::database::UUID_SIZE {
                 return Err(Error::BadFormat("Invalid Cipher"));
             } else {
@@ -445,7 +566,7 @@ fn read_header_field<R: Read>(input: &mut R, database: &mut PwDatabase, kdbx: &m
             }
         },
 
-        Some(KdbxHeaderFieldID::CompressionFlags) => {
+        Some(KdbxHeaderFieldID::COMPRESSION_FLAGS) => {
             if data.len() < 4 {
                 return Err(Error::BadFormat("Invalid Compression Algorithm"));
             } else {
@@ -459,14 +580,14 @@ fn read_header_field<R: Read>(input: &mut R, database: &mut PwDatabase, kdbx: &m
             }
         },
 
-        Some(KdbxHeaderFieldID::MasterSeed) => {
+        Some(KdbxHeaderFieldID::MASTER_SEED) => {
             kdbx.master_seed = ProtectedBinary::copy_slice(data);
             database.context.crypto_random.add_entropy(data);
             debug_println!("Set MasterSeed.");
         },
 
         // Obsolete; for backwards compatibility only
-        Some(KdbxHeaderFieldID::TransformSeed) => {
+        Some(KdbxHeaderFieldID::TRANSFORM_SEED) => {
             debug_assert!(kdbx.version < FILE_VERSION_32_4, "New KDBX file is using parameter `TransformSeed` from legacy KDBX versions.");
             let kdf = kdf::KdfEngine::Aes;
             if database.kdf_parameters.kdf_uuid != kdf.uuid() {
@@ -477,7 +598,7 @@ fn read_header_field<R: Read>(input: &mut R, database: &mut PwDatabase, kdbx: &m
         },
 
         // Obsolete; for backwards compatibility only
-        Some(KdbxHeaderFieldID::TransformRounds) => {
+        Some(KdbxHeaderFieldID::TRANSFORM_ROUNDS) => {
             debug_assert!(kdbx.version < FILE_VERSION_32_4, "New KDBX file is using parameter `TransformRounds` from legacy KDBX versions.");
             let kdf = kdf::KdfEngine::Aes;
             if database.kdf_parameters.kdf_uuid != kdf.uuid() {
@@ -487,26 +608,26 @@ fn read_header_field<R: Read>(input: &mut R, database: &mut PwDatabase, kdbx: &m
             debug_println!("Set TransformRounds.");
         },
 
-        Some(KdbxHeaderFieldID::EncryptionIV) => {
+        Some(KdbxHeaderFieldID::ENCRYPTION_IV) => {
             debug_assert!(kdbx.version < FILE_VERSION_32_4, "New KDBX file is using parameter `EncryptionIV` from legacy KDBX versions.");
             kdbx.encryption_iv = ProtectedBinary::copy_slice(data);
             debug_println!("Set EncryptionIV.");
         },
 
-        Some(KdbxHeaderFieldID::InnerRandomStreamKey) => {
+        Some(KdbxHeaderFieldID::INNER_RANDOM_STREAM_KEY) => {
             debug_assert!(kdbx.version < FILE_VERSION_32_4, "New KDBX file is using parameter `InnerRandomStreamKey` from legacy KDBX versions.");
             kdbx.inner_random_stream_key = ProtectedBinary::copy_slice(data);
             database.context.crypto_random.add_entropy(data);
             debug_println!("Set InnerRandomStreamKey.");
         },
 
-        Some(KdbxHeaderFieldID::StreamStartBytes) => {
+        Some(KdbxHeaderFieldID::STREAM_START_BYTES) => {
             debug_assert!(kdbx.version < FILE_VERSION_32_4, "New KDBX file is using parameter `StreamStartBytes` from legacy KDBX versions.");
             kdbx.stream_start_bytes = ProtectedBinary::copy_slice(data);
             debug_println!("Set StreamStartBytes.");
         },
 
-        Some(KdbxHeaderFieldID::InnerRandomStreamID) => {
+        Some(KdbxHeaderFieldID::INNER_RANDOM_STREAM_ID) => {
             let stream_id = memutil::bytes_to_u32(data);
             if let Some(alg) = CrsAlgorithm::from_int(stream_id) {
                 kdbx.inner_random_stream_algorithm = alg;
@@ -516,16 +637,16 @@ fn read_header_field<R: Read>(input: &mut R, database: &mut PwDatabase, kdbx: &m
             debug_println!("Set InnerRandomStreamID");
         },
 
-        Some(KdbxHeaderFieldID::KdfParameters) => {
+        Some(KdbxHeaderFieldID::KDF_PARAMETERS) => {
             database.kdf_parameters.clear();
-            kdf::KdfParameters::deserialize(&mut database.kdf_parameters, data);
+            kdf::KdfParameters::deserialize(&mut database.kdf_parameters, data)?;
             debug_println!("Set KdfParameters");
         },
 
-        Some(KdbxHeaderFieldID::PublicCustomData) => {
+        Some(KdbxHeaderFieldID::PUBLIC_CUSTOM_DATA) => {
             debug_assert!(database.public_custom_data.len() == 0, "Public custom data was not empty.");
             database.public_custom_data.clear();
-            crate::vdict::VariantDict::deserialize(&mut database.public_custom_data, data);
+            crate::vdict::VariantDict::deserialize(&mut database.public_custom_data, data)?;
             debug_println!("Set PublicCustom Data");
         },
 

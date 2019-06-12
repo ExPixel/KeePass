@@ -102,21 +102,21 @@ impl KdfEngine {
     }
 
     ///  Maximizes a parameter within a given time frame.
-    pub fn maximize_param_uint64(&self, p: &mut KdfParameters, name: &str, mut umin: u64, mut umax: u64, umillis: u64, interp_search: bool) -> Result<(), Error> {
+    pub fn maximize_param_uint64(&self, p: &mut KdfParameters, name: &str, umin: u64, umax: u64, umillis: u64, interp_search: bool) -> Result<(), Error> {
         // For now the default implementation is always called. I'm not aware of a KdfEngine in
         // KeePass that uses another implementation.
         self.default_maximize_param_uint64(p, name, umin, umax, umillis, interp_search)
     }
 
-    fn default_maximize_param_uint64(&self, p: &mut KdfParameters, name: &str, mut umin: u64, mut umax: u64, umillis: u64, interp_search: bool) -> Result<(), Error> {
+    fn default_maximize_param_uint64(&self, p: &mut KdfParameters, name: &str, umin: u64, mut umax: u64, umillis: u64, interp_search: bool) -> Result<(), Error> {
 
-        macro_rules! time_millis {
-            ($Expr:expr) => ({
-                let start = std::time::Instant::now();
-                $Expr;
-                start.elapsed().as_millis()
-            })
-        }
+        // macro_rules! time_millis {
+        //     ($Expr:expr) => ({
+        //         let start = std::time::Instant::now();
+        //         $Expr;
+        //         start.elapsed().as_millis()
+        //     })
+        // }
 
         debug_assert!(name.len() > 0, "`name` must not be an empty string.");
 
@@ -138,7 +138,7 @@ impl KdfEngine {
         let mut uhigh = umin + 1;
         let mut tlow = 0;
         let mut thigh = 0;
-        let mut ttarget = umillis;
+        let ttarget = umillis;
 
         // Determine range.
         while uhigh < umax {
@@ -260,7 +260,7 @@ pub mod aes {
 
         // I just overwrite the new_key array with the hashed value.
         new_key.copy_from_slice(&hasher.result());
-        Ok((new_key))
+        Ok(new_key)
     }
 
     pub fn transform_key_256(new_key: &mut [u8], key_seed_32: &[u8], rounds: u64) {
@@ -317,6 +317,7 @@ pub mod aes {
     }
 }
 
+// @TODO implement this KDF
 pub mod argon2 {
     use super::KdfParameters;
     use crate::constants;
@@ -325,7 +326,6 @@ pub mod argon2 {
     use crate::error::Error;
     use sha2::{Sha256, Digest};
 
-    // @TODO
     pub const UUID: PwUUID = PwUUID::wrap([
         0xEF, 0x63, 0x6D, 0xDF, 0x8C, 0x29, 0x44, 0x4B,
         0x91, 0xF7, 0xA9, 0xA4, 0x03, 0xE3, 0x0A, 0x0C
@@ -337,15 +337,15 @@ pub mod argon2 {
         unimplemented!("argon2::default_parameters");
     }
 
-    pub fn randomize(context: &mut Context, p: &mut KdfParameters) {
+    pub fn randomize(_context: &mut Context, _p: &mut KdfParameters) {
         unimplemented!("argon2::randomize");
     }
 
-    pub fn transform(msg: &[u8], p: &KdfParameters) -> Result<[u8; 32], Error> {
+    pub fn transform(_msg: &[u8], _p: &KdfParameters) -> Result<[u8; 32], Error> {
         unimplemented!("argon2::transform");
     }
 
-    pub fn best_parameters(millis: u64) -> KdfParameters {
+    pub fn best_parameters(_millis: u64) -> KdfParameters {
         unimplemented!("argon2::best_parameters");
     }
 }

@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports)]
+
 /// Temporary logging while I'm writing the library
 macro_rules! debug_println {
     ($fmt:expr) => {

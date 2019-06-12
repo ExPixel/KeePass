@@ -1,6 +1,6 @@
 use std::fmt;
 
-pub const KEEPASS_VERSION_1x: &str = "KeePass 1.x";
+pub const KEEPASS_VERSION_1X: &str = "KeePass 1.x";
 
 pub enum Error {
     // Sometimes I use this as a placeholder.

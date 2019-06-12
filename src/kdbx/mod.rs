@@ -134,34 +134,34 @@ const ELEM_STRING_DICT_EX_ITEM: &str = "Item";
 
 bitflags::bitflags! {
     struct KdbxHeaderFieldID: u8 {
-        const EndOfHeader = 0;
-        const Comment = 1;
-        const CipherID = 2;
-        const CompressionFlags = 3;
-        const MasterSeed = 4;
-        const TransformSeed = 5; // KDBX 3.1, for backword compatibility only
-        const TransformRounds = 6; // KDBX 3.1, for backward compatibility only
-        const EncryptionIV = 7;
-        const InnerRandomStreamKey = 8;
-        const StreamStartBytes = 9; // KDBX 3.1, for backward compatibility only
-        const InnerRandomStreamID = 10; // KDBX 3.1, for backward compatibility only
-        const KdfParameters = 11;
-        const PublicCustomData = 12; // KDBX 4
+        const END_OF_HEADER = 0;
+        const COMMENT = 1;
+        const CIPHER_ID = 2;
+        const COMPRESSION_FLAGS = 3;
+        const MASTER_SEED = 4;
+        const TRANSFORM_SEED = 5; // KDBX 3.1, for backword compatibility only
+        const TRANSFORM_ROUNDS = 6; // KDBX 3.1, for backward compatibility only
+        const ENCRYPTION_IV = 7;
+        const INNER_RANDOM_STREAM_KEY = 8;
+        const STREAM_START_BYTES = 9; // KDBX 3.1, for backward compatibility only
+        const INNER_RANDOM_STREAM_ID = 10; // KDBX 3.1, for backward compatibility only
+        const KDF_PARAMETERS = 11;
+        const PUBLIC_CUSTOM_DATA = 12; // KDBX 4
     }
 }
 
 bitflags::bitflags! {
     struct KdbxInnerHeaderFieldID: u8 {
-        const EndOfHeader = 0;
-        const InnerRandomStreamID = 1; // Supersedes KdbxHeaderFieldID.InnerRandomStreamID
-        const InnerRandomStreamKey = 2; // Supersedes KdbxHeaderFieldID.InnerRandomStreamKey
-        const Binary = 3;
+        const END_OF_HEADER = 0;
+        const INNER_RANDOM_STREAM_ID = 1; // Supersedes KdbxHeaderFieldID.InnerRandomStreamID
+        const INNER_RANDOM_STREAM_KEY = 2; // Supersedes KdbxHeaderFieldID.InnerRandomStreamKey
+        const BINARY = 3;
     }
 }
 
 bitflags::bitflags! {
     struct KdbxBinaryFlags: u8 {
-        const None = 0;
-        const Protected = 1;
+        const NONE = 0;
+        const PROTECTED = 1;
     }
 }

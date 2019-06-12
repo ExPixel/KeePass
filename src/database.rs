@@ -1,5 +1,7 @@
 use rand::prelude::*;
 use sha2::{Sha256, Digest};
+use chrono::DateTime;
+use chrono::offset::Utc;
 use std::collections::HashMap;
 use crate::security::{ProtectedString, ProtectedBinary};
 use crate::vdict::VariantDict;
@@ -9,7 +11,6 @@ use crate::memutil;
 use crate::crypto::kdf;
 use crate::error::Error;
 
-
 /// Core password manager. Contains groups which themselves contain password entries.
 pub struct PwDatabase {
     pub(crate) context: Box<Context>,
@@ -18,10 +19,24 @@ pub struct PwDatabase {
     pub(crate) kdf_parameters: KdfParameters,
     pub(crate) public_custom_data: VariantDict,
     pub(crate) master_key: CompositeKey,
+
+    pub name: String,
+    pub description: String,
+    pub default_username: String,
+
+    /// Number of days until history entries are deleted in a database maintenance operation.
+    pub maintenance_history_days: u32,
+
+    pub name_changed: DateTime<Utc>,
+    pub description_changed: DateTime<Utc>,
+    pub settings_changed: DateTime<Utc>,
+    pub default_username_changed: DateTime<Utc>,
 }
 
 impl PwDatabase {
     pub fn new() -> PwDatabase {
+        let now = Utc::now();
+
         PwDatabase {
             context: Box::new(Context::new()),
             data_cipher_uuid: PwUUID::zero(),
@@ -29,6 +44,17 @@ impl PwDatabase {
             kdf_parameters: KdfParameters::new(PwUUID::zero()),
             public_custom_data: VariantDict::new(),
             master_key: CompositeKey::new(),
+
+            name: String::new(),
+            description: String::new(),
+            default_username: String::new(),
+
+            maintenance_history_days: 365,
+
+            name_changed: now.clone(),
+            description_changed: now.clone(),
+            settings_changed: now.clone(),
+            default_username_changed: now.clone(),
         }
     }
 
@@ -154,7 +180,7 @@ impl KcpPassword {
         }
     }
 
-    pub fn is_valid_password(pass: &str) -> bool {
+    pub fn is_valid_password(_pass: &str) -> bool {
         // @TODO this should make sure that the password is valid unicode and is normalized.
         // For now it just always returns true for all strings.
         true

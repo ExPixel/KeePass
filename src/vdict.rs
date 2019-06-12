@@ -338,7 +338,5 @@ impl VariantDict {
                 }
             }
         }
-
-        Ok(())
     }
 }

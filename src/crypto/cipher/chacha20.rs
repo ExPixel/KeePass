@@ -63,7 +63,7 @@ impl BlockCipher for ChaCha20 {
             }
         }
 
-        let mut working_state = unsafe {
+        let working_state = unsafe {
             std::slice::from_raw_parts_mut(dest.as_mut_ptr() as *mut u32, 16)
         };
         working_state.copy_from_slice(&self.state);

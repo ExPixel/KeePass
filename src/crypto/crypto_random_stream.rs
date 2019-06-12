@@ -87,7 +87,7 @@ impl CryptoRandomStream {
         // state = [0, 1, 2, 3, ..., 255]
         state.iter_mut().enumerate().for_each(|(idx, elem)| *elem = idx as u8);
 
-        let mut j = 0u8;
+        let mut j;
         let mut key_idx = 0;
 
         for w in 0..state.len() {
