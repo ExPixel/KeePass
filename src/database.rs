@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
+use crate::constants;
 use rand::prelude::*;
 use sha2::{Sha256, Digest};
 use chrono::DateTime;
@@ -11,50 +14,133 @@ use crate::memutil;
 use crate::crypto::kdf;
 use crate::error::Error;
 
+pub type Color = (u8, u8, u8, u8);
+pub const COLOR_ZERO: Color = (0, 0, 0, 0);
+
+#[inline]
+fn default_time() -> DateTime<Utc> {
+    chrono::MIN_DATE.and_hms(0, 0, 0)
+}
+
 /// Core password manager. Contains groups which themselves contain password entries.
 pub struct PwDatabase {
     pub(crate) context: Box<Context>,
+
+    /// Tne encryption algorithm used to encrypt the data part of the database.
     pub(crate) data_cipher_uuid: PwUUID,
+
+    /// The compression algorithm used to compress the data part of teh database.
     pub(crate) compression_algorithm: PwCompressionAlgorithm,
+
+    /// Contains the number of key transformation rounds for the KDF.
     pub(crate) kdf_parameters: KdfParameters,
-    pub(crate) public_custom_data: VariantDict,
+
     pub(crate) master_key: CompositeKey,
 
+    pub root_group: Rc<RefCell<PwGroup>>,
+
+    /// Memory protection configuration for default fields.
+    pub memory_protection: MemoryProtectionConfig,
+
     pub name: String,
+    pub name_changed: DateTime<Utc>,
+
     pub description: String,
+    pub description_changed: DateTime<Utc>,
+
     pub default_username: String,
+    pub default_username_changed: DateTime<Utc>,
+
+    /// Color in the form (R, G, B, A)
+    pub color: Color,
 
     /// Number of days until history entries are deleted in a database maintenance operation.
     pub maintenance_history_days: u32,
-
-    pub name_changed: DateTime<Utc>,
-    pub description_changed: DateTime<Utc>,
     pub settings_changed: DateTime<Utc>,
-    pub default_username_changed: DateTime<Utc>,
+
+    pub recycle_bin_enabled: bool,
+    pub recycle_bin_changed: DateTime<Utc>,
+    pub recycle_bin_uuid: PwUUID,
+
+    pub master_key_changed: DateTime<Utc>,
+    pub master_key_change_rec: i64,
+    pub master_key_change_force: i64,
+    pub master_key_change_force_once: bool,
+
+    pub entry_templates_group: PwUUID,
+    pub entry_templates_group_changed: DateTime<Utc>,
+
+    pub last_selected_group: PwUUID,
+    pub last_top_visible_group: PwUUID,
+
+    pub history_max_items: i32,
+    pub history_max_size: i64,
+
+    /// Custom data container that can be used by plugins to store own data in KeePass databases.
+    /// The data here is stored in teh encrypted part of the encrypted database file.
+    pub custom_data: HashMap<String, String>,
+
+    /// All custom icons stored in this database.
+    pub custom_icons: Vec<PwCustomIcon>,
+
+    /// Custom data container that can be used by plguins to store their own data in KeePass
+    /// databases. The data is stored in the *unencrypted* part of database files, and it is not
+    /// supported by all file formats (e.g. supported by KDBX, unsupported by XML.)
+    /// It is highly recommended to use `custom_data` instead, if possible.
+    pub public_custom_data: VariantDict,
+
+    /// Hash value of the primary file on disk (last read or last write).
+    pub hash_of_file_on_disk: [u8; 32],
+    pub hash_of_last_io: [u8; 32],
+
+    pub use_file_locks: bool,
+    pub use_file_transactions: bool,
+    pub detach_binaries: bool,
+
+    pub deleted_objects: Vec<PwDeletedObject>,
 }
 
 impl PwDatabase {
     pub fn new() -> PwDatabase {
-        let now = Utc::now();
-
         PwDatabase {
             context: Box::new(Context::new()),
             data_cipher_uuid: PwUUID::zero(),
             compression_algorithm: PwCompressionAlgorithm::None,
             kdf_parameters: KdfParameters::new(PwUUID::zero()),
-            public_custom_data: VariantDict::new(),
             master_key: CompositeKey::new(),
-
+            memory_protection: MemoryProtectionConfig::default(),
             name: String::new(),
             description: String::new(),
             default_username: String::new(),
-
+            color: (0, 0, 0, 0),
             maintenance_history_days: 365,
-
-            name_changed: now.clone(),
-            description_changed: now.clone(),
-            settings_changed: now.clone(),
-            default_username_changed: now.clone(),
+            master_key_change_rec: -1,
+            master_key_change_force: -1,
+            master_key_change_force_once:  false,
+            name_changed: default_time(),
+            description_changed: default_time(),
+            settings_changed: default_time(),
+            default_username_changed: default_time(),
+            master_key_changed: default_time(),
+            recycle_bin_changed: default_time(),
+            entry_templates_group: PwUUID::zero(),
+            entry_templates_group_changed: default_time(),
+            deleted_objects: Vec::new(),
+            recycle_bin_uuid: PwUUID::zero(),
+            history_max_items: constants::DEFAULT_HISTORY_MAX_ITEMS,
+            history_max_size: constants::DEFAULT_HISTORY_MAX_SIZE,
+            custom_data: HashMap::new(),
+            custom_icons: Vec::new(),
+            public_custom_data: VariantDict::new(),
+            hash_of_file_on_disk: [0u8; 32],
+            hash_of_last_io: [0u8; 32],
+            use_file_locks: false,
+            use_file_transactions: false,
+            detach_binaries: false,
+            recycle_bin_enabled: false,
+            last_selected_group: PwUUID::zero(),
+            last_top_visible_group: PwUUID::zero(),
+            root_group: PwGroup::default().wrap(),
         }
     }
 
@@ -65,17 +151,389 @@ impl PwDatabase {
 
 /// A group containing subgroups and entries.
 pub struct PwGroup {
+    /// Parent group of this group.
+    pub parent: Option<Weak<RefCell<PwGroup>>>,
+
+    /// A list of subgroups in this group.
+    pub groups: Vec<Rc<RefCell<PwGroup>>>,
+
+    /// A list of entries in this group.
+    pub entries: Vec<Rc<RefCell<PwEntry>>>,
+
+    /// UUID of this group.
+    pub uuid: PwUUID,
+
+    /// Name of this group.
+    pub name: String,
+
+    /// Comments about this group.
+    pub notes: String,
+
+    /// Icon of this group.
+    pub icon: PwIcon,
+
+    /// Get the custom icon ID. This value is 0, if no custom icon is
+    /// being used (i.e. the icon specified by the `IconID` property
+    /// should be displayed).
+    pub custom_icon_uuid: PwUUID,
+
+    /// The date/time when the location of the group was last changed.
+    pub location_changed: DateTime<Utc>,
+
+
+    /// A flag that specifies if the group is shown as expanded or
+    /// collapsed in the user interface.
+    pub(crate) is_expanded: bool,
+
+    /// The date/time when this group was created.
+    pub creation_time: DateTime<Utc>,
+
+    /// The date/time when this group was last modified.
+    pub last_modification_time: DateTime<Utc>,
+
+    /// The date/time when this group was last accessed (read).
+    pub last_access_time: DateTime<Utc>,
+
+    /// The date/time when this group expires.
+    pub expiry_time: DateTime<Utc>,
+
+    /// Flag that determines if this group expires.
+    pub expires: bool,
+
+    /// To increase the usage count, use the `touch` function.
+    pub usage_count: u64,
+
+    /// A flag specifying whether this group is virtual or not. Virtual
+    /// groups can contain links to entries stored in other groups.
+    /// Note that this flag has to be interpreted and set by the calling
+    /// code; it won't prevent you from accessing and modifying the list
+    /// of entries in this group in any way.
+    pub is_virtual: bool,
+
+    /// Default auto-type keystroke sequence for all entries in
+    /// this group. This property can be an empty string, which
+    /// means that the value should be inherited from the parent.
+    pub default_autotype_sequence: String,
+
+    pub enable_autotype: Option<bool>,
+    pub enable_searching: Option<bool>,
+    pub last_top_visible_entry: PwUUID,
+
+    /// Custom data container that can be used by plugins to store
+    /// own data in KeePass groups.
+    /// The data is stored in the encrypted part of encrypted
+    /// database files.
+    /// Use unique names for your items, e.g. "PluginName_ItemName".
+    pub custom_data: HashMap<String, String>,
+}
+
+impl PwGroup {
+    pub const DEFAULT_AUTOTYPE_ENABLED: bool = true;
+    pub const DEFAULT_SEARCHING_ENABLED: bool = true;
+    pub const MAX_DEPTH: usize = 126;
+
+    /// Create a new PwGroup and initialize the UUID and the times.
+    pub fn init() -> PwGroup {
+        PwGroup::new(true, true, PwIcon::Folder)
+    }
+
+    pub fn new(create_new_uuid: bool, set_times: bool, icon: PwIcon) -> PwGroup {
+        let uuid = if create_new_uuid {
+            PwUUID::random()
+        } else {
+            PwUUID::zero()
+        };
+
+        let time = if set_times {
+            Utc::now()
+        } else {
+            default_time()
+        };
+
+        PwGroup {
+            parent: None,
+            groups: Vec::new(),
+            entries: Vec::new(),
+            uuid: uuid,
+            name: String::new(),
+            notes: String::new(),
+            icon: icon,
+            custom_icon_uuid: PwUUID::zero(),
+            location_changed: time.clone(),
+            is_expanded: true,
+            creation_time: time.clone(),
+            last_modification_time: time.clone(),
+            last_access_time: time.clone(),
+            expiry_time: time.clone(),
+            expires: false,
+            usage_count: 0,
+            is_virtual: false,
+            default_autotype_sequence: String::new(),
+            enable_autotype: None,
+            enable_searching: None,
+            last_top_visible_entry: PwUUID::zero(),
+            custom_data: HashMap::new(),
+        }
+    }
+
+    /// Initialize all of the timestamps to the current time.
+    pub fn init_timestamps(&mut self) {
+        let now = Utc::now();
+        self.creation_time = now.clone();
+        self.last_modification_time = now.clone();
+        self.last_access_time = now.clone();
+        self.location_changed = now.clone();
+    }
+
+    pub fn add_entry(this: &Rc<RefCell<Self>>, entry: Rc<RefCell<PwEntry>>, take_ownership: bool, update_location_changed_of_entry: bool) {
+        if take_ownership {
+            entry.borrow_mut().parent_group = Some(Rc::downgrade(this));
+        }
+
+        if update_location_changed_of_entry {
+            entry.borrow_mut().location_changed = Utc::now();
+        }
+
+        this.borrow_mut().entries.push(entry);
+    }
+
+    pub fn add_group(this: &Rc<RefCell<Self>>, sub_group: Rc<RefCell<PwGroup>>, take_ownership: bool, update_location_changed_of_entry: bool) {
+        if take_ownership {
+            sub_group.borrow_mut().parent = Some(Rc::downgrade(this));
+        }
+
+        if update_location_changed_of_entry {
+            sub_group.borrow_mut().location_changed = Utc::now();
+        }
+
+        this.borrow_mut().groups.push(sub_group);
+    }
+
+    #[inline]
+    pub fn wrap(self) -> Rc<RefCell<PwGroup>> {
+        Rc::new(RefCell::new(self))
+    }
+}
+
+impl Default for PwGroup {
+    fn default() -> PwGroup {
+        PwGroup::new(false, false, PwIcon::Folder)
+    }
 }
 
 /// A password entry. Consists of several fields like a title, user name, password, ect. Each
 /// password entry has a unique UUID.
 pub struct PwEntry {
+    /// UUID of this entry.
     pub uuid: PwUUID,
+
+    /// Reference to the parent group that contains this entry.
+    pub parent_group: Option<Weak<RefCell<PwGroup>>>,
+
+    /// The date/time when the location of this entry was last changed.
+    pub location_changed: DateTime<Utc>,
+
+    /// All strings associated with this entry.
     pub strings: HashMap<String, ProtectedString>,
+
+    /// All binaries associated with this entry.
     pub binaries: HashMap<String, ProtectedBinary>,
+
+    /// Auto-type Window/Keystroke sequence associations.
+    pub auto_type: AutoTypeConfig,
+
+    /// Previous versions of this entry.
+    pub history: Vec<Rc<RefCell<PwEntry>>>,
+
+    /// Image ID specifying the icon that will be used for this entry.
     pub icon: PwIcon,
-    // @TODO In the original implementation this includes a reference to its parent. Not sure how I
-    // want to implement that in Rust.
+
+    /// The custom icon ID for this entry. This value is 0 if no custom icon is being used.
+    pub custom_icon_uuid: PwUUID,
+
+    /// The foreground color of this entry.
+    pub foreground_color: Color,
+
+    /// The background color of this entry.
+    pub background_color: Color,
+
+    /// The date/time when this entry was created.
+    pub creation_time: DateTime<Utc>,
+
+    /// The date/time when this entry was last modified (written to).
+    pub last_modification_time: DateTime<Utc>,
+
+    /// The date/time when this entry was last accessed (read from).
+    pub last_access_time: DateTime<Utc>,
+
+    /// The date/time when this entry expires.
+    pub expiry_time: DateTime<Utc>,
+
+    /// Specifies whether the entry expires or not.
+    pub expires: bool,
+
+    /// The usage count of this entry. Increment this counter by using the `touch` method.
+    pub usage_count: u64,
+
+    /// Entry-specific override URL if this string is not empty.
+    pub override_url: String,
+
+    /// List of tags associated with this entry.
+    pub tags: Vec<String>,
+
+    /// Custom data container that can be used by plugins to store
+    /// own data in KeePass entries.
+    /// The data is stored in the encrypted part of encrypted
+    /// database files.
+    /// Use unique names for your items, e.g. "PluginName_ItemName".
+    pub custom_data: HashMap<String, String>,
+}
+
+impl PwEntry {
+    pub fn new(parent_group: Option<Weak<RefCell<PwGroup>>>, create_new_uuid: bool, set_times: bool) -> PwEntry {
+        let uuid = if create_new_uuid {
+            PwUUID::random()
+        } else {
+            PwUUID::zero()
+        };
+
+        let time = if set_times {
+            Utc::now()
+        } else {
+            default_time()
+        };
+
+        PwEntry {
+            uuid: uuid,
+            parent_group: parent_group,
+            location_changed: time.clone(),
+            strings: HashMap::new(),
+            binaries: HashMap::new(),
+            auto_type: AutoTypeConfig::new(),
+            history: Vec::new(),
+            icon: PwIcon::Key,
+            custom_icon_uuid: PwUUID::zero(),
+            foreground_color: COLOR_ZERO,
+            background_color: COLOR_ZERO,
+            creation_time: time.clone(),
+            last_modification_time: time.clone(),
+            last_access_time: time.clone(),
+            expiry_time: time.clone(),
+            expires: false,
+            usage_count: 0,
+            override_url: String::new(),
+            tags: Vec::new(),
+            custom_data: HashMap::new(),
+        }
+    }
+
+    /// Initialize all of the timestamps to the current time.
+    pub fn init_timestamps(&mut self) {
+        let now = Utc::now();
+        self.creation_time = now.clone();
+        self.last_modification_time = now.clone();
+        self.last_access_time = now.clone();
+        self.location_changed = now.clone();
+    }
+
+    #[inline]
+    pub fn wrap(self) -> Rc<RefCell<PwEntry>> {
+        Rc::new(RefCell::new(self))
+    }
+}
+
+impl Default for PwEntry {
+    fn default() -> PwEntry {
+        PwEntry::new(None, false, false)
+    }
+}
+
+
+/// A list of auto-type associations.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AutoTypeConfig {
+    /// Specify whether the auto-type is enabled or not.
+    pub enabled: bool,
+    /// Specify whether the typing should be obfuscated.
+    pub obfuscation_options: AutoTypeObfuscationOptions,
+    /// The default keystroke sequence that is auto-typed if no matching window is found in the
+    /// `associations` vector.
+    pub default_sequence: String,
+    /// Get all auto-type window/keystroke pairs.
+    pub associations: Vec<AutoTypeAssociation>,
+}
+
+impl AutoTypeConfig {
+    pub fn new() -> AutoTypeConfig {
+        AutoTypeConfig {
+            enabled: true,
+            obfuscation_options: AutoTypeObfuscationOptions::None,
+            default_sequence: String::new(),
+            associations: Vec::new(),
+        }
+    }
+
+    pub fn add(&mut self, assoc: AutoTypeAssociation) {
+        self.associations.push(assoc);
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AutoTypeAssociation {
+    window: String,
+    sequence: String,
+}
+
+impl AutoTypeAssociation {
+    pub fn new(window: String, sequence: String) -> AutoTypeAssociation {
+        AutoTypeAssociation { window, sequence }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum AutoTypeObfuscationOptions {
+    None = 0,
+    UseClipboard = 1,
+}
+
+impl AutoTypeObfuscationOptions {
+    pub fn from_int(n: u32) -> Option<AutoTypeObfuscationOptions> {
+        match n {
+            0 => Some(AutoTypeObfuscationOptions::None),
+            1 => Some(AutoTypeObfuscationOptions::UseClipboard),
+            _ => None,
+        }
+    }
+
+    pub fn to_int(self) -> u32 {
+        match self {
+            AutoTypeObfuscationOptions::None => 0,
+            AutoTypeObfuscationOptions::UseClipboard => 1,
+        }
+    }
+}
+
+/// Represents an object that has been deleted.
+#[derive(Clone)]
+pub struct PwDeletedObject {
+    /// UUID of the object that has been deleted.
+    pub uuid: PwUUID,
+
+    /// The date/time when the object was deleted.
+    pub deletion_time: DateTime<Utc>,
+}
+
+impl PwDeletedObject {
+    pub fn new(uuid: PwUUID, deletion_time: DateTime<Utc>) -> PwDeletedObject {
+        PwDeletedObject { uuid, deletion_time }
+    }
+}
+
+impl Default for PwDeletedObject {
+    fn default() -> PwDeletedObject {
+        PwDeletedObject::new(PwUUID::ZERO, default_time())
+    }
 }
 
 /// The standard size of a PwUUID in bytes.
@@ -87,7 +545,7 @@ pub struct PwUUID([u8; UUID_SIZE]);
 
 impl PwUUID {
     pub const SIZE: usize = 16;
-    const ZERO: PwUUID = PwUUID([0u8; UUID_SIZE]);
+    pub const ZERO: PwUUID = PwUUID([0u8; UUID_SIZE]);
 
     /// Wrap an array of bytes of the correct size in a PwUUID.
     pub const fn wrap(data: [u8; UUID_SIZE]) -> PwUUID {
@@ -283,6 +741,28 @@ impl CompositeKey {
     }
 }
 
+#[derive(Default, Clone)]
+pub struct MemoryProtectionConfig {
+    pub protect_title: bool,
+    pub protect_username: bool,
+    pub protect_password: bool,
+    pub protect_url: bool,
+    pub protect_notes: bool,
+}
+
+impl MemoryProtectionConfig {
+    pub fn is_protected(&self, field: &str) -> bool {
+        match field {
+            constants::TITLE_FIELD => self.protect_title,
+            constants::USERNAME_FIELD => self.protect_username,
+            constants::PASSWORD_FIELD => self.protect_password,
+            constants::URL_FIELD => self.protect_url,
+            constants::NOTES_FIELD => self.protect_notes,
+            _ => false,
+        }
+    }
+}
+
 /// Compression algorithm specifiers.
 pub enum PwCompressionAlgorithm {
     /// No compression algorithm.
@@ -327,6 +807,8 @@ pub enum PwMergeMethod {
 }
 
 /// Icon identifiers for groups and password entries.
+#[derive(Copy, Clone)]
+#[repr(u32)]
 pub enum PwIcon {
     Key = 0,
     World,
@@ -397,7 +879,43 @@ pub enum PwIcon {
     Money,
     Certificate,
     BlackBerry,
-    Count
+    Count,
+}
+
+impl PwIcon {
+    pub fn from_int(n: u32) -> Option<PwIcon> {
+        // @TODO replace this with a safer implementation
+        unsafe {
+            let count = std::mem::transmute::<PwIcon, u32>(PwIcon::Count);
+            if n < count {
+                Some(std::mem::transmute::<u32, PwIcon>(n))
+            } else {
+                None
+            }
+        }
+    }
+
+    pub fn to_int(self) -> u32 {
+        // @TODO replace this with a safer implementation
+        unsafe {
+            std::mem::transmute(self)
+        }
+    }
+}
+
+/// A custom icon.
+pub struct PwCustomIcon {
+    uuid: PwUUID,
+    image_data_png: Vec<u8>,
+}
+
+impl PwCustomIcon {
+    pub const MAX_WIDTH: u32 = 128;
+    pub const MAX_HEIGHT: u32 = 128;
+
+    pub fn new(uuid: PwUUID, image_data_png: Vec<u8>) -> PwCustomIcon {
+        PwCustomIcon { uuid, image_data_png }
+    }
 }
 
 pub enum ProxyServerType {

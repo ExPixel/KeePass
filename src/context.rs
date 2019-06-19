@@ -48,17 +48,19 @@ impl CryptoRandom {
             hasher.input(entropy);
             let entropy = hasher.result();
 
-            let mut new_entropy = ProtectedBinary::new(self.entropy_pool.len() + entropy.len());
-            ProtectedBinary::copy_into(&mut new_entropy, 0, &self.entropy_pool);
-            ProtectedBinary::copy_into(&mut new_entropy, self.entropy_pool.len(), &entropy);
+            let mut new_entropy_vec = Vec::with_capacity(self.entropy_pool.len() + entropy.len());
+            new_entropy_vec.extend_from_slice(&self.entropy_pool);
+            new_entropy_vec.extend_from_slice(&entropy);
+            self.entropy_pool = ProtectedBinary::wrap(new_entropy_vec);
 
             let mut hasher = Sha256::new();
             hasher.input(&self.entropy_pool);
             self.entropy_pool = ProtectedBinary::copy_slice(&hasher.result());
         } else {
-            let mut new_entropy = ProtectedBinary::new(self.entropy_pool.len() + entropy.len());
-            ProtectedBinary::copy_into(&mut new_entropy, 0, &self.entropy_pool);
-            ProtectedBinary::copy_into(&mut new_entropy, self.entropy_pool.len(), entropy);
+            let mut new_entropy_vec = Vec::with_capacity(self.entropy_pool.len() + entropy.len());
+            new_entropy_vec.extend_from_slice(&self.entropy_pool);
+            new_entropy_vec.extend_from_slice(&entropy);
+            self.entropy_pool = ProtectedBinary::wrap(new_entropy_vec);
 
             let mut hasher = Sha256::new();
             hasher.input(&self.entropy_pool);

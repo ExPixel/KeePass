@@ -67,12 +67,10 @@ impl<C: BlockCipher> CtrBlockCipher64<C> {
                 self.cursor = 0;
             }
             let c = std::cmp::min(data.len() - offset, self.block.len() - self.cursor);
-            println!("xor({}, {}, {})", offset, self.cursor, c);
             crate::memutil::xor_slices(&mut data[offset..(offset + c)], &self.block[self.cursor..(self.cursor + c)]);
             self.cursor += c;
             offset += c;
         }
-        println!("outy 5000 [{}]", data.len());
     }
 }
 

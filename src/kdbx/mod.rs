@@ -60,6 +60,8 @@ const ELEM_ENTRY_TEMPLATES_GROUP: &str = "EntryTemplatesGroup";
 const ELEM_ENTRY_TEMPLATES_GROUP_CHANGED: &str = "EntryTemplatesGroupChanged";
 const ELEM_HISTORY_MAX_ITEMS: &str = "HistoryMaxItems";
 const ELEM_HISTORY_MAX_SIZE: &str = "HistoryMaxSize";
+const ELEM_LAST_SELECTED_GROUP: &str = "LastSelectedGroup";
+const ELEM_LAST_TOP_VISIBLE_GROUP: &str = "LastTopVisibleGroup";
 
 const ELEM_MEMORY_PROT: &str = "MemoryProtection";
 const ELEM_PROT_TITLE: &str = "ProtectTitle";

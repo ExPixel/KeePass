@@ -20,29 +20,54 @@ pub fn read32_le(bytes: &[u8], index: usize) -> u32 {
     }
 }
 
-pub fn hex_to_bytes(hex: &[u8]) -> Vec<u8> {
+#[derive(Clone, Copy)]
+pub struct ParseHexError;
+
+/// Parses an HTML string in the form `#RRGGBB` or `#AARRGGBB`
+/// and returns a tuple in the form `(r, g, b, a)`
+pub fn parse_hex_color(hex: &str) -> Result<(u8, u8, u8, u8), ParseHexError> {
+    let off = if hex.starts_with('#') { 1 } else { 0 };
+    let hex = &hex.as_bytes()[off..];
+    if hex.len() == 6 {
+        let r = hex_pair_to_byte((hex[0], hex[1]))?;
+        let g = hex_pair_to_byte((hex[2], hex[3]))?;
+        let b = hex_pair_to_byte((hex[4], hex[5]))?;
+        Ok((r, g, b, 255))
+    } else if hex.len() == 8 {
+        let r = hex_pair_to_byte((hex[0], hex[1]))?;
+        let g = hex_pair_to_byte((hex[2], hex[3]))?;
+        let b = hex_pair_to_byte((hex[4], hex[5]))?;
+        let a = hex_pair_to_byte((hex[6], hex[7]))?;
+        Ok((r, g, b, a))
+    } else {
+        return Err(ParseHexError)
+    }
+}
+
+pub fn hex_to_bytes(hex: &[u8]) -> Result<Vec<u8>, ParseHexError> {
     assert!(hex.len() % 2 == 0);
     let mut dest = Vec::new();
 
     for byte in hex.chunks(2) {
-        dest.push(hex_pair_to_byte((byte[0], byte[1])));
+        dest.push(hex_pair_to_byte((byte[0], byte[1]))?);
     }
 
-    return dest;
+    return Ok(dest);
 }
 
-pub fn hex_pair_to_byte(pair: (u8, u8)) -> u8 {
-    let hi = hex_to_nibble(pair.0);
-    let lo = hex_to_nibble(pair.1);
+pub fn hex_pair_to_byte(pair: (u8, u8)) -> Result<u8, ParseHexError> {
+    let hi = hex_to_nibble(pair.0)?;
+    let lo = hex_to_nibble(pair.1)?;
 
-    return (hi << 4) | lo;
+    return Ok((hi << 4) | lo);
 
-    fn hex_to_nibble(hex: u8) -> u8 {
+    #[inline(always)]
+    fn hex_to_nibble(hex: u8) -> Result<u8, ParseHexError> {
         match hex {
-            b'0'...b'9' => hex - b'0',
-            b'A'...b'F' => hex - b'A' + 10,
-            b'a'...b'f' => hex - b'a' + 10,
-            _ => panic!("hex digit out of range."),
+            b'0'...b'9' => Ok(hex - b'0'),
+            b'A'...b'F' => Ok(hex - b'A' + 10),
+            b'a'...b'f' => Ok(hex - b'a' + 10),
+            _ => Err(ParseHexError)
         }
     }
 }
@@ -62,6 +87,7 @@ pub fn xor_slices(mut dst: &mut [u8], mut src: &[u8]) {
     }
 }
 
+/// Converts a raw byte to a hex pair of ASCII characters.
 pub fn to_hex_char_pair(n: u8) -> (u8, u8) {
     static HEX_CHARS: [u8; 16] = [
             b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7',
@@ -254,3 +280,23 @@ pub fn zero_vec<T: Sized + Clone + Default>(dst: &mut Vec<T>) {
     dst.clear();
 }
 
+pub fn decompress(bytes: &[u8]) -> Result<Vec<u8>, Error> {
+    use std::io::Read;
+    use flate2::read::GzDecoder;
+
+    let mut gz = GzDecoder::new(bytes);
+    let mut dest = Vec::new();
+    gz.read_to_end(&mut dest).map_err(|e| Error::IO(e))?;
+    Ok(dest)
+}
+
+pub fn compress(bytes: &[u8]) -> Result<Vec<u8>, Error> {
+    use std::io::Write;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    gz.write_all(bytes).map_err(|e| Error::IO(e))?;
+
+    Ok(gz.finish().map_err(|e| Error::IO(e))?)
+}

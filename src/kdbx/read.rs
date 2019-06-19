@@ -1,3 +1,5 @@
+use std::rc::Rc;
+use std::cell::RefCell;
 use std::io::prelude::*;
 use chrono::prelude::*;
 use std::io::BufReader;
@@ -7,10 +9,11 @@ use flate2::read::GzDecoder;
 use xml::reader::{EventReader, XmlEvent};
 
 use crate::error::{self, Error};
-use crate::database::{PwDatabase, PwUUID, PwCompressionAlgorithm};
+use crate::database::{PwDatabase, PwCustomIcon, PwEntry, PwGroup, PwUUID, PwIcon, PwCompressionAlgorithm, PwDeletedObject, AutoTypeObfuscationOptions, AutoTypeAssociation};
 use crate::memutil;
-use crate::security::{ProtectedBinary, XorredBuffer};
+use crate::security::{ProtectedBinary, ProtectedString, XorredBuffer};
 use crate::ioutil::{self, StoredReadRef};
+use crate::strutil;
 use crate::crypto::kdf;
 use crate::crypto::crypto_random_stream::{CrsAlgorithm, CryptoRandomStream};
 use crate::crypto::cipher::{CipherEngine, TransformRead};
@@ -32,8 +35,28 @@ pub struct Kdbx {
     hash_of_header: ProtectedBinary,
     hash_of_file_on_disk: ProtectedBinary,
     binaries: Vec<ProtectedBinary>,
-
     repair_mode: bool,
+    detach_binaries: Option<String>,
+
+    custom_icon_id: PwUUID,
+    custom_icon_data: Vec<u8>,
+    custom_data_key: Option<String>,
+    custom_data_value: Option<String>,
+    ctx_groups: Vec<Rc<RefCell<PwGroup>>>,
+    ctx_entry: Option<Rc<RefCell<PwEntry>>>,
+    ctx_history_base: Option<Rc<RefCell<PwEntry>>>,
+    ctx_string_name: Option<String>,
+    ctx_string_value: Option<ProtectedString>,
+    ctx_binary_name: Option<String>,
+    ctx_binary_value: Option<ProtectedBinary>,
+    ctx_deleted_object: Option<PwDeletedObject>,
+    entry_in_history: bool,
+    group_custom_data_key: Option<String>,
+    group_custom_data_value: Option<String>,
+    entry_custom_data_key: Option<String>,
+    entry_custom_data_value: Option<String>,
+    ctx_at_name: Option<String>,
+    ctx_at_seq: Option<String>,
 }
 
 impl Kdbx {
@@ -51,8 +74,28 @@ impl Kdbx {
             hash_of_file_on_disk: ProtectedBinary::empty(),
             binaries: Vec::new(),
             random_stream: CryptoRandomStream::new(CrsAlgorithm::None, &[0]),
-
             repair_mode: false,
+            detach_binaries: None,
+
+            custom_icon_id: PwUUID::zero(),
+            custom_icon_data: Vec::new(),
+            custom_data_key: None,
+            custom_data_value: None,
+            group_custom_data_key: None,
+            group_custom_data_value: None,
+            entry_custom_data_key: None,
+            entry_custom_data_value: None,
+            ctx_groups: Vec::new(),
+            ctx_entry: None,
+            ctx_history_base: None,
+            ctx_string_name: None,
+            ctx_string_value: None,
+            ctx_binary_name: None,
+            ctx_binary_value: None,
+            ctx_at_name: None,
+            ctx_at_seq: None,
+            ctx_deleted_object: None,
+            entry_in_history: false,
         }
     }
 
@@ -91,25 +134,23 @@ impl Kdbx {
 }
 
 
-pub fn load_kdbx_file<PathRef: AsRef<Path>>(p: PathRef, format: KdbxFormat, database: &mut PwDatabase) -> Result<(), Error> {
+pub fn load_kdbx_file<PathRef: AsRef<Path>>(p: PathRef, format: KdbxFormat, database: &mut PwDatabase, kdbx: &mut Kdbx) -> Result<(), Error> {
     let file = std::fs::File::open(p).map_err(|e| Error::IO(e))?;
     let mut buffered = BufReader::new(file);
-    load_kdbx(&mut buffered, format, database)
+    load_kdbx(&mut buffered, format, database, kdbx)
 }
 
-pub fn load_kdbx<R: Read>(input: &mut R, format: KdbxFormat, database: &mut PwDatabase) -> Result<(), Error> {
-    let mut kdbx = Kdbx::new();
-
+pub fn load_kdbx<R: Read>(input: &mut R, format: KdbxFormat, database: &mut PwDatabase, kdbx: &mut Kdbx) -> Result<(), Error> {
     let mut input = ioutil::ReadInto::new(input, Sha256::new());
 
     if format == KdbxFormat::PlainXml {
         // This is unencrypted so it doesn't contain any of the encryption headers.
-        return load_kdbx_unencrypted(&mut input, database, &mut kdbx);
+        return load_kdbx_unencrypted(&mut input, database, kdbx);
     }
 
     let header_data = {
         let mut stored_input = ioutil::StoredReadRef::new(&mut input);
-        load_header(&mut stored_input, database, &mut kdbx)?;
+        load_header(&mut stored_input, database, kdbx)?;
         stored_input.data()
     };
 
@@ -148,10 +189,10 @@ pub fn load_kdbx<R: Read>(input: &mut R, format: KdbxFormat, database: &mut PwDa
         let mut block_stream = HashedBlockRead::new(&mut decrypt_stream, true);
 
         match database.compression_algorithm {
-            PwCompressionAlgorithm::None => load_kdbx_unencrypted(&mut block_stream, database, &mut kdbx)?,
+            PwCompressionAlgorithm::None => load_kdbx_unencrypted(&mut block_stream, database, kdbx)?,
             PwCompressionAlgorithm::GZip => {
                 let mut gz_decode_stream = GzDecoder::new(&mut block_stream);
-                load_kdbx_unencrypted(&mut gz_decode_stream, database, &mut kdbx)?
+                load_kdbx_unencrypted(&mut gz_decode_stream, database, kdbx)?
             },
         }
     } else {
@@ -197,8 +238,22 @@ struct XmlStartElement {
     attributes: Vec<xml::attribute::OwnedAttribute>,
 }
 
+impl XmlStartElement {
+    #[inline(always)]
+    pub fn is_name(&self, name: &str) -> bool {
+        self.name.local_name.as_str() == name
+    }
+}
+
 struct XmlEndElement {
     name: xml::name::OwnedName,
+}
+
+impl XmlEndElement {
+    #[inline(always)]
+    pub fn is_name(&self, name: &str) -> bool {
+        self.name.local_name.as_str() == name
+    }
 }
 
 pub fn load_kdbx_unencrypted<R: Read>(input: &mut R, database: &mut PwDatabase, kdbx: &mut Kdbx) -> Result<(), Error> {
@@ -219,11 +274,12 @@ pub fn load_kdbx_unencrypted<R: Read>(input: &mut R, database: &mut PwDatabase, 
 
         match event {
             XmlEvent::StartElement { name, attributes, .. } => {
-                println!("- start element with context: {:?}", ctx);
+                debug_println!("Start element `{}` with context: {:?}", name.local_name, ctx);
                 ctx = read_start_xml_element(database, kdbx, ctx, &mut xml, XmlStartElement { name, attributes })?;
             },
-            XmlEvent::EndElement { .. } => {
-                // @TODO handle element close
+            XmlEvent::EndElement { name, .. } => {
+                debug_println!("End element `{}` with context: {:?}", name.local_name, ctx);
+                ctx = read_end_xml_element(database, kdbx, ctx, &mut xml, XmlEndElement { name })?;
             },
             XmlEvent::StartDocument { .. } => { /* NOP */ }
             XmlEvent::EndDocument { .. } => { break; }
@@ -236,6 +292,7 @@ pub fn load_kdbx_unencrypted<R: Read>(input: &mut R, database: &mut PwDatabase, 
 
     // @TODO return an error instead.
     assert_eq!(KdbContext::Null, ctx, "Bad ending context value");
+    assert_eq!(0, kdbx.ctx_groups.len(), "Ended with open groups.");
 
     Ok(())
 }
@@ -246,7 +303,7 @@ fn read_start_xml_element<R: Read>(database: &mut PwDatabase, kdbx: &mut Kdbx, c
             if elem.name.local_name == ELEM_DOC_NODE {
                 return Ok(KdbContext::KeePassFile);
             } else {
-                xml_skip_element(xml, &elem)?;
+                xml_read_unknown(kdbx, xml, &elem)?;
             }
         },
         KdbContext::KeePassFile => {
@@ -255,12 +312,13 @@ fn read_start_xml_element<R: Read>(database: &mut PwDatabase, kdbx: &mut Kdbx, c
             } else if elem.name.local_name == ELEM_ROOT {
                 return Ok(KdbContext::Root);
             } else {
-                xml_skip_element(xml, &elem)?;
+                xml_read_unknown(kdbx, xml, &elem)?;
             }
         },
         KdbContext::Meta => {
+            debug_println!("Reading tag in meta context: {}", elem.name.local_name);
             match elem.name.local_name.as_str() {
-                ELEM_GENERATOR => xml_skip_element(xml, &elem)?, // ignore
+                ELEM_GENERATOR => xml_read_unknown(kdbx, xml, &elem)?, // ignore
                 ELEM_HEADER_HASH => {
                     let hash = xml_read_string(kdbx, xml, &elem)?;
                     if hash.len() > 0 && kdbx.hash_of_header.len() > 0 && !kdbx.repair_mode {
@@ -278,16 +336,504 @@ fn read_start_xml_element<R: Read>(database: &mut PwDatabase, kdbx: &mut Kdbx, c
                 ELEM_DB_DESC_CHANGED => database.description_changed = xml_read_time(kdbx, xml, &elem)?,
                 ELEM_DB_DEFAULT_USER => database.default_username = xml_read_string(kdbx, xml, &elem)?,
                 ELEM_DB_DEFAULT_USER_CHANGED => database.default_username_changed = xml_read_time(kdbx, xml, &elem)?,
-                ELEM_DB_MNTNC_HISTORY_DAYS => database.maintenance_history_days = xml_read_uint(kdbx, xml, &elem)?,
+                ELEM_DB_MNTNC_HISTORY_DAYS => database.maintenance_history_days = xml_read_uint(kdbx, xml, &elem)?.unwrap_or(365),
+                ELEM_DB_COLOR => {
+                     let color_string = xml_read_string(kdbx, xml, &elem)?;
+                     database.color = memutil::parse_hex_color(&color_string).map_err(|_| Error::BadFormat("Invalid hex color."))?;
+                },
+                ELEM_DB_KEY_CHANGED => database.master_key_changed = xml_read_time(kdbx, xml, &elem)?,
+                ELEM_DB_KEY_CHANGE_REC => database.master_key_change_rec = xml_read_long(kdbx, xml, &elem)?.unwrap_or(-1),
+                ELEM_DB_KEY_CHANGE_FORCE => database.master_key_change_force = xml_read_long(kdbx, xml, &elem)?.unwrap_or(-1),
+                ELEM_DB_KEY_CHANGE_FORCE_ONCE => database.master_key_change_force_once = xml_read_bool(kdbx, xml, &elem)?.unwrap_or(false),
+                ELEM_MEMORY_PROT => return Ok(KdbContext::MemoryProtection),
+                ELEM_CUSTOM_ICONS => return Ok(KdbContext::CustomIcons),
+                ELEM_RECYCLE_BIN_ENABLED => database.recycle_bin_enabled = xml_read_bool(kdbx, xml, &elem)?.unwrap_or(true),
+                ELEM_RECYCLE_BIN_UUID => database.recycle_bin_uuid = xml_read_uuid(kdbx, xml, &elem)?,
+                ELEM_RECYCLE_BIN_CHANGED => database.recycle_bin_changed = xml_read_time(kdbx, xml, &elem)?,
+                ELEM_ENTRY_TEMPLATES_GROUP => database.entry_templates_group = xml_read_uuid(kdbx, xml, &elem)?,
+                ELEM_ENTRY_TEMPLATES_GROUP_CHANGED => database.entry_templates_group_changed = xml_read_time(kdbx, xml, &elem)?,
+                ELEM_HISTORY_MAX_ITEMS => database.history_max_items = xml_read_int(kdbx, xml, &elem)?.unwrap_or(-1),
+                ELEM_HISTORY_MAX_SIZE => database.history_max_size = xml_read_long(kdbx, xml, &elem)?.unwrap_or(-1),
+                ELEM_LAST_SELECTED_GROUP => database.last_selected_group = xml_read_uuid(kdbx, xml, &elem)?,
+                ELEM_LAST_TOP_VISIBLE_GROUP => database.last_top_visible_group = xml_read_uuid(kdbx, xml, &elem)?,
+                ELEM_BINARIES => return Ok(KdbContext::Binaries),
+                ELEM_CUSTOM_DATA => return Ok(KdbContext::CustomData),
                 _ => {
+                    xml_read_unknown(kdbx, xml, &elem)?
                 }
             }
         },
-        _ => {
-            return Err(Error::Generic("Unhandled XML Context"));
+        KdbContext::MemoryProtection => {
+            match elem.name.local_name.as_str() {
+                ELEM_PROT_TITLE => database.memory_protection.protect_title = xml_read_bool(kdbx, xml, &elem)?.unwrap_or(false),
+                ELEM_PROT_USER_NAME =>database.memory_protection.protect_username = xml_read_bool(kdbx, xml, &elem)?.unwrap_or(false),
+                ELEM_PROT_PASSWORD => database.memory_protection.protect_password = xml_read_bool(kdbx, xml, &elem)?.unwrap_or(true),
+                ELEM_PROT_URL => database.memory_protection.protect_url = xml_read_bool(kdbx, xml, &elem)?.unwrap_or(false),
+                ELEM_PROT_NOTES => database.memory_protection.protect_notes = xml_read_bool(kdbx, xml, &elem)?.unwrap_or(false),
+
+                _ => xml_read_unknown(kdbx, xml, &elem)?,
+            }
+        },
+        KdbContext::CustomIcons => {
+            if elem.is_name(ELEM_CUSTOM_ICONS) {
+                return Ok(KdbContext::CustomIcon);
+            } else {
+                xml_read_unknown(kdbx, xml, &elem)?
+            }
+        },
+        KdbContext::CustomIcon => {
+            if elem.is_name(ELEM_CUSTOM_ICON_ITEM_ID) {
+                kdbx.custom_icon_id = xml_read_uuid(kdbx, xml, &elem)?;
+            } else if elem.is_name(ELEM_CUSTOM_ICON_ITEM_DATA) {
+                let data = xml_read_string(kdbx, xml, &elem)?;
+                debug_assert!(data.len() > 0, "Empty custom icon data.");
+                if data.len() > 0 {
+                    kdbx.custom_icon_data = base64::decode(data.as_bytes()).map_err(|_| Error::BadFormat("Invalid Base64 data."))?;
+                }
+            } else {
+                xml_read_unknown(kdbx, xml, &elem)?
+            }
+        },
+        KdbContext::Binaries => {
+            if elem.is_name(ELEM_BINARY) {
+                let maybe_attr_id = elem.attributes.iter().find(|attr| attr.name.local_name == ATTR_ID);
+                if let Some(attr_id) = maybe_attr_id {
+                    let key = attr_id.value.parse::<usize>().map_err(|_| Error::BadFormat("Invalid binary index."))?;
+
+                    kdbx.binaries.resize_with(key + 1, || ProtectedBinary::empty());
+                    kdbx.binaries[key] = xml_read_protected_binary(kdbx, xml, &elem)?;
+                } else {
+                    xml_read_unknown(kdbx, xml, &elem)?
+                }
+            } else {
+                xml_read_unknown(kdbx, xml, &elem)?
+            }
+        },
+        KdbContext::CustomData => {
+            if elem.is_name(ELEM_STRING_DICT_EX_ITEM) {
+                return Ok(KdbContext::CustomDataItem);
+            } else {
+                xml_read_unknown(kdbx, xml, &elem)?
+            }
+        },
+        KdbContext::CustomDataItem => {
+            if elem.is_name(ELEM_KEY) {
+                kdbx.custom_data_key = Some(xml_read_string(kdbx, xml, &elem)?);
+            } else if elem.is_name(ELEM_VALUE) {
+                kdbx.custom_data_value = Some(xml_read_string(kdbx, xml, &elem)?);
+            } else {
+                xml_read_unknown(kdbx, xml, &elem)?
+            }
+        },
+        KdbContext::Root => {
+            if elem.is_name(ELEM_GROUP) {
+                debug_assert!(kdbx.ctx_groups.len() == 0, "Context groups already populated.");
+                if kdbx.ctx_groups.len() != 0 {
+                    return Err(Error::BadFormat("Context groups already populated."));
+                }
+                database.root_group = PwGroup::default().wrap();
+                kdbx.ctx_groups.push(Rc::clone(&database.root_group));
+                return Ok(KdbContext::Group);
+            } else if elem.is_name(ELEM_DELETED_OBJECTS) {
+                return Ok(KdbContext::RootDeletedObjects);
+            } else {
+                xml_read_unknown(kdbx, xml, &elem)?
+            }
+        },
+        KdbContext::Group => {
+            if let Some(group) = kdbx.ctx_groups.last().map(Rc::clone) {
+                match elem.name.local_name.as_str() {
+                    ELEM_UUID => group.borrow_mut().uuid = xml_read_uuid(kdbx, xml, &elem)?,
+                    ELEM_NAME => group.borrow_mut().name = xml_read_string(kdbx, xml, &elem)?,
+                    ELEM_NOTES => group.borrow_mut().notes = xml_read_string(kdbx, xml, &elem)?,
+                    ELEM_ICON => group.borrow_mut().icon = xml_read_icon_id(kdbx, xml, &elem)?.unwrap_or(PwIcon::Folder),
+                    ELEM_CUSTOM_ICON_ID => group.borrow_mut().custom_icon_uuid = xml_read_uuid(kdbx, xml, &elem)?,
+                    ELEM_TIMES => return Ok(KdbContext::GroupTimes),
+                    ELEM_IS_EXPANDED => group.borrow_mut().is_expanded = xml_read_bool(kdbx, xml, &elem)?.unwrap_or(true),
+                    ELEM_GROUP_DEFAULT_AUTO_TYPE_SEQ => group.borrow_mut().default_autotype_sequence = xml_read_string(kdbx, xml, &elem)?,
+                    ELEM_ENABLE_AUTO_TYPE => group.borrow_mut().enable_autotype = strutil::string_to_bool_ex(&xml_read_string(kdbx, xml, &elem)?),
+                    ELEM_ENABLE_SEARCHING => group.borrow_mut().enable_searching = strutil::string_to_bool_ex(&xml_read_string(kdbx, xml, &elem)?),
+                    ELEM_LAST_TOP_VISIBLE_ENTRY => group.borrow_mut().last_top_visible_entry = xml_read_uuid(kdbx, xml, &elem)?,
+                    ELEM_CUSTOM_DATA => return Ok(KdbContext::GroupCustomData),
+                    ELEM_GROUP => {
+                        let sub_group = PwGroup::default().wrap();
+                        PwGroup::add_group(&group, Rc::clone(&sub_group), true, false);
+                        kdbx.ctx_groups.push(sub_group);
+                        return Ok(KdbContext::Group);
+                    },
+                    ELEM_ENTRY => {
+                        let entry = PwEntry::default().wrap();
+                        if let Some(ref mut group) = kdbx.ctx_groups.last() {
+                            PwGroup::add_entry(&group, Rc::clone(&entry), true, false);
+                        } else {
+                            return Err(Error::BadFormat("No group for KDBX entry."));
+                        }
+                        kdbx.ctx_entry = Some(entry);
+                        return Ok(KdbContext::Entry);
+                    },
+                    _ => xml_read_unknown(kdbx, xml, &elem)?,
+                }
+            } else {
+                // @TODO this should probably be an error but it doesn't seem to even be a
+                // consideration in the original C# implementation.
+                debug_assert!(false, "No group set.");
+                xml_read_unknown(kdbx, xml, &elem)?
+            }
         }
+        KdbContext::GroupCustomData => {
+            if elem.is_name(ELEM_STRING_DICT_EX_ITEM) {
+                return Ok(KdbContext::GroupCustomDataItem);
+            } else {
+                xml_read_unknown(kdbx, xml, &elem)?
+            }
+        },
+        KdbContext::GroupCustomDataItem => {
+            if elem.is_name(ELEM_KEY) {
+                kdbx.group_custom_data_key = Some(xml_read_string(kdbx, xml, &elem)?);
+            } else if elem.is_name(ELEM_VALUE) {
+                kdbx.group_custom_data_value = Some(xml_read_string(kdbx, xml, &elem)?);
+            } else {
+                xml_read_unknown(kdbx, xml, &elem)?
+            }
+        },
+        KdbContext::Entry => {
+            if let Some(entry_cell) = kdbx.ctx_entry.as_ref().map(Rc::clone) {
+                let mut entry = entry_cell.borrow_mut();
+                match elem.name.local_name.as_str() {
+                    ELEM_UUID => entry.uuid = xml_read_uuid(kdbx, xml, &elem)?,
+                    ELEM_ICON => entry.icon = xml_read_icon_id(kdbx, xml, &elem)?.unwrap_or(PwIcon::Key),
+                    ELEM_CUSTOM_ICON_ID => entry.custom_icon_uuid = xml_read_uuid(kdbx, xml, &elem)?,
+                    ELEM_FG_COLOR => {
+                        // @TODO this should parse actual HTML color values
+                        entry.foreground_color = memutil::parse_hex_color(&(xml_read_string(kdbx, xml, &elem)?)).unwrap_or((0, 0, 0, 0));
+                    },
+                    ELEM_BG_COLOR => {
+                        // @TODO this should parse actual HTML color values
+                        entry.background_color = memutil::parse_hex_color(&(xml_read_string(kdbx, xml, &elem)?)).unwrap_or((0, 0, 0, 0));
+                    },
+                    ELEM_OVERRIDE_URL => {
+                        entry.override_url = xml_read_string(kdbx, xml, &elem)?;
+                    },
+                    ELEM_TAGS => {
+                        entry.tags = strutil::string_to_tags(&xml_read_string(kdbx, xml, &elem)?);
+                    },
+                    ELEM_TIMES => {
+                        return Ok(KdbContext::EntryTimes);
+                    },
+                    ELEM_STRING => {
+                        return Ok(KdbContext::EntryString);
+                    },
+                    ELEM_BINARY => {
+                        return Ok(KdbContext::EntryBinary);
+                    },
+                    ELEM_AUTO_TYPE => {
+                        return Ok(KdbContext::EntryAutoType);
+                    },
+                    ELEM_CUSTOM_DATA => {
+                        return Ok(KdbContext::EntryCustomData);
+                    },
+                    ELEM_HISTORY => {
+                        debug_assert!(!kdbx.entry_in_history, "Entry is already in history.");
+
+                        if !kdbx.entry_in_history {
+                            kdbx.ctx_history_base = kdbx.ctx_entry.as_ref().map(|e| Rc::clone(e));
+                            return Ok(KdbContext::EntryHistory);
+                        } else {
+                            xml_read_unknown(kdbx, xml, &elem)?
+                        }
+                    },
+                    _ => xml_read_unknown(kdbx, xml, &elem)?,
+                }
+            }
+        },
+        KdbContext::GroupTimes => {
+            if let Some(group_cell) = kdbx.ctx_groups.last().map(Rc::clone) {
+                let mut group = group_cell.borrow_mut();
+                match elem.name.local_name.as_str() {
+                    ELEM_CREATION_TIME => group.creation_time = xml_read_time(kdbx, xml, &elem)?,
+                    ELEM_LAST_MOD_TIME => group.last_modification_time = xml_read_time(kdbx, xml, &elem)?,
+                    ELEM_LAST_ACCESS_TIME => group.last_access_time = xml_read_time(kdbx, xml, &elem)?,
+                    ELEM_EXPIRY_TIME => group.expiry_time = xml_read_time(kdbx, xml, &elem)?,
+                    ELEM_EXPIRES => group.expires = xml_read_bool(kdbx, xml, &elem)?.unwrap_or(false),
+                    ELEM_USAGE_COUNT => group.usage_count = xml_read_ulong(kdbx, xml, &elem)?.unwrap_or(0),
+                    ELEM_LOCATION_CHANGED => group.location_changed = xml_read_time(kdbx, xml, &elem)?,
+                    _ => xml_read_unknown(kdbx, xml, &elem)?,
+                }
+            } else {
+                debug_assert!(false, "No group for times.");
+                xml_read_unknown(kdbx, xml, &elem)?
+            }
+        },
+        KdbContext::EntryTimes => {
+            if let Some(entry_cell) = kdbx.ctx_entry.as_ref().map(Rc::clone) {
+                let mut entry = entry_cell.borrow_mut();
+                match elem.name.local_name.as_str() {
+                    ELEM_CREATION_TIME => entry.creation_time = xml_read_time(kdbx, xml, &elem)?,
+                    ELEM_LAST_MOD_TIME => entry.last_modification_time = xml_read_time(kdbx, xml, &elem)?,
+                    ELEM_LAST_ACCESS_TIME => entry.last_access_time = xml_read_time(kdbx, xml, &elem)?,
+                    ELEM_EXPIRY_TIME => entry.expiry_time = xml_read_time(kdbx, xml, &elem)?,
+                    ELEM_EXPIRES => entry.expires = xml_read_bool(kdbx, xml, &elem)?.unwrap_or(false),
+                    ELEM_USAGE_COUNT => entry.usage_count = xml_read_ulong(kdbx, xml, &elem)?.unwrap_or(0),
+                    ELEM_LOCATION_CHANGED => entry.location_changed = xml_read_time(kdbx, xml, &elem)?,
+                    _ => xml_read_unknown(kdbx, xml, &elem)?,
+                }
+            } else {
+                debug_assert!(false, "No entry for times.");
+                xml_read_unknown(kdbx, xml, &elem)?
+            }
+        },
+        KdbContext::EntryString => {
+            if elem.is_name(ELEM_KEY) {
+                kdbx.ctx_string_name = Some(xml_read_string(kdbx, xml, &elem)?);
+            } else if elem.is_name(ELEM_VALUE) {
+                kdbx.ctx_string_value = Some(xml_read_protected_string(kdbx, xml, &elem)?);
+            } else {
+                xml_read_unknown(kdbx, xml, &elem)?
+            }
+        },
+        KdbContext::EntryBinary => {
+            if elem.is_name(ELEM_KEY) {
+                kdbx.ctx_binary_name = Some(xml_read_string(kdbx, xml, &elem)?);
+            } else if elem.is_name(ELEM_VALUE) {
+                kdbx.ctx_binary_value = Some(xml_read_protected_binary(kdbx, xml, &elem)?);
+            } else {
+                xml_read_unknown(kdbx, xml, &elem)?
+            }
+        },
+        KdbContext::EntryAutoType => {
+            match elem.name.local_name.as_str() {
+                ELEM_AUTO_TYPE_ENABLED => {
+                    let v = xml_read_bool(kdbx, xml, &elem)?.unwrap_or(true);
+                    kdbx.ctx_entry.as_ref().map(|e| e.borrow_mut().auto_type.enabled = v).ok_or(Error::BadFormat("No entry for field."))?;
+                },
+                ELEM_AUTO_TYPE_OBFUSCATION => {
+                    let v = AutoTypeObfuscationOptions::from_int(xml_read_uint(kdbx, xml, &elem)?.unwrap_or(0)).unwrap_or(AutoTypeObfuscationOptions::None);
+                    kdbx.ctx_entry.as_ref().map(|e| e.borrow_mut().auto_type.obfuscation_options = v).ok_or(Error::BadFormat("No entry for field."))?;
+                },
+                ELEM_AUTO_TYPE_DEFAULT_SEQ => {
+                    let v = xml_read_string(kdbx, xml, &elem)?;
+                    kdbx.ctx_entry.as_ref().map(|e| e.borrow_mut().auto_type.default_sequence = v).ok_or(Error::BadFormat("No entry for field."))?;
+                },
+                ELEM_AUTO_TYPE_ITEM => {
+                    return Ok(KdbContext::EntryAutoTypeItem);
+                },
+                _ => xml_read_unknown(kdbx, xml, &elem)?
+            }
+        },
+        KdbContext::EntryAutoTypeItem => {
+            if elem.is_name(ELEM_WINDOW) {
+                kdbx.ctx_at_name = Some(xml_read_string(kdbx, xml, &elem)?);
+            } else if elem.is_name(ELEM_KEYSTROKE_SEQUENCE) {
+                kdbx.ctx_at_seq = Some(xml_read_string(kdbx, xml, &elem)?);
+            } else {
+                xml_read_unknown(kdbx, xml, &elem)?
+            }
+        },
+        KdbContext::EntryCustomData => {
+            if elem.is_name(ELEM_STRING_DICT_EX_ITEM) {
+                return Ok(KdbContext::EntryCustomDataItem);
+            } else {
+                xml_read_unknown(kdbx, xml, &elem)?
+            }
+        },
+        KdbContext::EntryCustomDataItem => {
+            if elem.is_name(ELEM_KEY) {
+                kdbx.entry_custom_data_key = Some(xml_read_string(kdbx, xml, &elem)?);
+            } else if elem.is_name(ELEM_VALUE) {
+                kdbx.entry_custom_data_value = Some(xml_read_string(kdbx, xml, &elem)?);
+            } else {
+                xml_read_unknown(kdbx, xml, &elem)?
+            }
+        },
+        KdbContext::EntryHistory => {
+            if elem.is_name(ELEM_ENTRY) {
+                let entry = PwEntry::new(None, false, false).wrap();
+                if let Some(ref mut history_base) = kdbx.ctx_history_base {
+                    history_base.borrow_mut().history.push(Rc::clone(&entry));
+                } else {
+                    debug_assert!(false, "No history base entry for history item.");
+                    return Err(Error::BadFormat("No history base."));
+                }
+                kdbx.ctx_entry = Some(entry);
+            } else {
+                xml_read_unknown(kdbx, xml, &elem)?
+            }
+        },
+        KdbContext::RootDeletedObjects => {
+            if elem.is_name(ELEM_DELETED_OBJECT) {
+                // @NOTE unlike in the original KeePass source, we add the deleted object to the
+                // database when the tag is closed instead of when it is opened.
+                kdbx.ctx_deleted_object = Some(PwDeletedObject::default());
+            } else {
+                xml_read_unknown(kdbx, xml, &elem)?
+            }
+        },
+        KdbContext::DeletedObject => {
+            if elem.is_name(ELEM_UUID) {
+                let uuid = xml_read_uuid(kdbx, xml, &elem)?;
+                kdbx.ctx_deleted_object.as_mut().map(|d| d.uuid = uuid).ok_or(Error::BadFormat("No deleted object."))?;
+            } else if elem.is_name(ELEM_DELETION_TIME) {
+                let time = xml_read_time(kdbx, xml, &elem)?;
+                kdbx.ctx_deleted_object.as_mut().map(|d| d.deletion_time = time).ok_or(Error::BadFormat("No deleted object."))?;
+            } else {
+                xml_read_unknown(kdbx, xml, &elem)?
+            }
+        },
     }
     return Ok(ctx);
+}
+
+fn read_end_xml_element<R: Read>(database: &mut PwDatabase, kdbx: &mut Kdbx, ctx: KdbContext, _xml: &mut EventReader<R>, elem: XmlEndElement) -> Result<KdbContext, Error> {
+    match (ctx, elem.name.local_name.as_str()) {
+        (KdbContext::KeePassFile, ELEM_DOC_NODE) =>  return Ok(KdbContext::Null),
+        (KdbContext::Meta, ELEM_META) =>  return Ok(KdbContext::KeePassFile),
+        (KdbContext::Root, ELEM_ROOT) =>  return Ok(KdbContext::KeePassFile),
+        (KdbContext::MemoryProtection, ELEM_MEMORY_PROT) =>  return Ok(KdbContext::Meta),
+        (KdbContext::CustomIcons, ELEM_CUSTOM_ICONS) => return Ok(KdbContext::Meta),
+        (KdbContext::CustomIcon, ELEM_CUSTOM_ICON_ITEM) => {
+            if kdbx.custom_icon_id == PwUUID::ZERO && kdbx.custom_icon_data.len() > 0 {
+                database.custom_icons.push(
+                    PwCustomIcon::new(
+                        std::mem::replace(&mut kdbx.custom_icon_id, PwUUID::ZERO),
+                        std::mem::replace(&mut kdbx.custom_icon_data, Vec::new())
+                    )
+                );
+                return Ok(KdbContext::CustomIcons);
+            } else {
+                return Err(Error::BadFormat("Empty custom icon."));
+            }
+        },
+        (KdbContext::Binaries, ELEM_BINARIES) => return Ok(KdbContext::Meta),
+        (KdbContext::CustomData, ELEM_CUSTOM_DATA) => return Ok(KdbContext::Meta),
+        (KdbContext::CustomDataItem, ELEM_STRING_DICT_EX_ITEM) => {
+            if let (Some(key), Some(value)) = (kdbx.custom_data_key.take(), kdbx.custom_data_value.take()) {
+                database.custom_data.insert(key, value);
+            } else {
+                debug_assert!(false, "No custom data key and/or custom data value.");
+            }
+            return Ok(KdbContext::CustomData);
+        }
+        (KdbContext::Group, ELEM_GROUP) => {
+            if let Some(group_cell) = kdbx.ctx_groups.pop() {
+                let mut group = group_cell.borrow_mut();
+                if group.uuid.is_zero() {
+                    group.uuid = PwUUID::random();
+                }
+            } else {
+                debug_assert!(false, "No group D:");
+            }
+
+            if kdbx.ctx_groups.len() > 0 {
+                return Ok(KdbContext::Group);
+            } else {
+                return Ok(KdbContext::Root);
+            }
+        },
+        (KdbContext::GroupTimes, ELEM_TIMES) => return Ok(KdbContext::Group),
+        (KdbContext::GroupCustomData, ELEM_CUSTOM_DATA) => return Ok(KdbContext::Group),
+        (KdbContext::GroupCustomDataItem, ELEM_STRING_DICT_EX_ITEM) =>  {
+            if let (Some(key), Some(value)) = (kdbx.group_custom_data_key.take(), kdbx.group_custom_data_value.take()) {
+                if let Some(ref mut group_cell) = kdbx.ctx_groups.last() {
+                    let mut group = group_cell.borrow_mut();
+                    group.custom_data.insert(key, value);
+                } else {
+                    debug_assert!(false, "Expected a group here.");
+                }
+            } else {
+                debug_assert!(false, "No group custom data key and/or custom data value.");
+            }
+            return Ok(KdbContext::GroupCustomData);
+        },
+        (KdbContext::Entry, ELEM_ENTRY) => {
+            if let Some(ref mut entry_cell) = kdbx.ctx_entry {
+                let mut entry = entry_cell.borrow_mut();
+                if entry.uuid.is_zero() {
+                    entry.uuid = PwUUID::random();
+                }
+            }
+
+            if kdbx.entry_in_history {
+                kdbx.ctx_entry = kdbx.ctx_history_base.as_ref().map(Rc::clone);
+            }
+
+            return Ok(KdbContext::Group);
+        },
+        (KdbContext::EntryTimes, ELEM_TIMES) => return Ok(KdbContext::Entry),
+        (KdbContext::EntryString, ELEM_STRING) => {
+            if let (Some(name), Some(value)) = (kdbx.ctx_string_name.take(), kdbx.ctx_string_value.take()) {
+                if let Some(ref mut entry_cell) = kdbx.ctx_entry {
+                    let mut entry = entry_cell.borrow_mut();
+                    entry.strings.insert(name, value);
+                } else {
+                    return Err(Error::BadFormat("No entry for string name/value."));
+                }
+            } else {
+                return Err(Error::BadFormat("End of string with no name/value."));
+            }
+            return Ok(KdbContext::Entry);
+        },
+        (KdbContext::EntryBinary, ELEM_BINARY) => {
+            if let (Some(name), Some(value)) = (kdbx.ctx_binary_name.take(), kdbx.ctx_binary_value.take()) {
+                if kdbx.detach_binaries.as_ref().map(|d| d.len()).unwrap_or(0) == 0 {
+                    if let Some(ref mut entry_cell) = kdbx.ctx_entry {
+                        let mut entry = entry_cell.borrow_mut();
+                        entry.binaries.insert(name, value);
+                    } else {
+                        return Err(Error::BadFormat("No entry for binary."));
+                    }
+                } else {
+                    unimplemented!("SaveBinary is not yet implemented");
+                }
+            } else {
+                return Err(Error::BadFormat("End of binary with no name/value."));
+            }
+            return Ok(KdbContext::Entry);
+        },
+        (KdbContext::EntryAutoType, ELEM_AUTO_TYPE) => return Ok(KdbContext::Entry),
+        (KdbContext::EntryAutoTypeItem, ELEM_AUTO_TYPE_ITEM) => {
+            if let (Some(at_name), Some(at_seq)) = (kdbx.ctx_at_name.take(), kdbx.ctx_at_seq.take()) {
+                let at_assoc = AutoTypeAssociation::new(at_name, at_seq);
+                kdbx.ctx_entry
+                    .as_ref()
+                    .map(|e| e.borrow_mut())
+                    .map(|mut e| e.auto_type.add(at_assoc))
+                    .ok_or(Error::BadFormat("No entry for auto type item."))?;
+                return Ok(KdbContext::EntryAutoType);
+            } else {
+                return Err(Error::BadFormat("End of AutoTypeItem with no name/seq"));
+            }
+        },
+        (KdbContext::EntryCustomData, ELEM_CUSTOM_DATA) => return Ok(KdbContext::Entry),
+        (KdbContext::EntryCustomDataItem, ELEM_STRING_DICT_EX_ITEM) => {
+            if let (Some(key), Some(val)) = (kdbx.entry_custom_data_key.take(), kdbx.entry_custom_data_value.take()) {
+                kdbx.ctx_entry
+                    .as_ref()
+                    .map(|e| e.borrow_mut())
+                    .map(|mut e| e.custom_data.insert(key, val))
+                    .ok_or(Error::BadFormat("No entry for custom data item."))?;
+                return Ok(KdbContext::EntryCustomData);
+            } else {
+                return Err(Error::BadFormat("end of entry custom data item with no key/value."));
+            }
+        }
+        (KdbContext::EntryHistory, ELEM_HISTORY) => {
+            kdbx.entry_in_history = false;
+            return Ok(KdbContext::Entry)
+        },
+        (KdbContext::RootDeletedObjects, ELEM_DELETED_OBJECTS) => {
+            // @NOTE the original KeePass source actually clears this in (DeletedObject, ELEM_DELETED_OBJECT) but it's done here instead.
+            if let Some(deleted_object) = kdbx.ctx_deleted_object.take() {
+                database.deleted_objects.push(deleted_object);
+            }
+            return Ok(KdbContext::Root);
+        }
+        (KdbContext::DeletedObject, ELEM_DELETED_OBJECT) => {
+            return Ok(KdbContext::RootDeletedObjects);
+        }
+        _ => {
+            return Err(Error::Generic("Unhandled XML Context (Element End)"));
+        }
+    }
 }
 
 /// Reads until this reads the end of the current element. This will also handle skipping any
@@ -325,9 +871,11 @@ fn xml_skip_element<R: Read>(xml: &mut EventReader<R>, elem: &XmlStartElement) -
     Ok(())
 }
 
-/// Reads the text contents of an XML element.
+/// Reads the text contents of an XML element. This will also skip past the end of the current
+/// element.
 fn xml_read_contents<R: Read>(xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<String, Error> {
     let mut depth = 0;
+    let mut contents = String::new();
     loop {
         let event = match xml.next() {
             Ok(event_ok) => event_ok,
@@ -346,14 +894,16 @@ fn xml_read_contents<R: Read>(xml: &mut EventReader<R>, elem: &XmlStartElement) 
                     if name != elem.name {
                         return Err(Error::XmlError);
                     }
-                    return Ok(String::new());
+                    break;
                 }
                 depth -= 1;
             },
 
             XmlEvent::Characters(text) => {
                 if depth == 0 {
-                    return Ok(text);
+                    contents = text;
+                    // here we get the contents but we don't actually leave the loop until the end
+                    // of the element is reached.
                 }
             }
 
@@ -364,10 +914,158 @@ fn xml_read_contents<R: Read>(xml: &mut EventReader<R>, elem: &XmlStartElement) 
             _ => { /* NOP */ }
         }
     }
+
+    Ok(contents)
 }
 
-fn xml_read_uint<R: Read>(kdbx: &mut Kdbx, xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<u32, Error> {
-    xml_read_string(kdbx, xml, elem)?.parse::<u32>().map_err(|_| Error::BadFormat("Invalid 32-bit integer."))
+
+// @TODO later it might be better to use dynamic dispatch instead to reduce code bloat by doing the
+// following because at the moment a version of all of this code is generated for each type of
+// reader :o
+// fn xml_read_uuid(kdbx: &mut Kdbx, xml: &mut EventReader<&mut dyn Read>, elem: &XmlStartElement) -> Result<bool, Error> {
+
+fn xml_read_unknown<R: Read>(kdbx: &mut Kdbx, xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<(), Error> {
+    debug_println!("!! Reading Unknown ({})", elem.name.local_name);
+
+    let mut depth = 0i32;
+
+    loop {
+        let event = match xml.next() {
+            Ok(event_ok) => event_ok,
+            Err(_) => {
+                return Err(Error::XmlError);
+            },
+        };
+
+        match event {
+            XmlEvent::StartElement {..} => {
+                depth += 1;
+
+                // Reading these keeps the random number generator consistent.
+                xml_process_node(kdbx, xml, elem)?;
+            },
+
+            XmlEvent::EndElement { name, .. } => {
+                if depth == 0 {
+                    if elem.name == name {
+                        return Ok(())
+                    } else {
+                        return Err(Error::XmlError);
+                    }
+                }
+                depth -= 1;
+            },
+
+            XmlEvent::EndDocument => {
+                return Err(Error::BadFormat("Unexpected end of XML document."));
+            }
+
+            _ => { /* NOP */ }
+        }
+    }
+}
+
+fn xml_read_protected_binary<R: Read>(kdbx: &mut Kdbx, xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<ProtectedBinary, Error> {
+    let mut maybe_bin_ref: Option<usize> = None;
+    let mut compressed: bool = false;
+    for attr in elem.attributes.iter() {
+        if attr.name.local_name == ATTR_COMPRESSED && attr.value == VAL_TRUE {
+            compressed = true;
+        }
+
+        if attr.name.local_name == ATTR_REF {
+            let index = xml_read_int(kdbx, xml, elem)?.unwrap_or(-1);
+            if index < 0 {
+                return Err(Error::BadFormat("Invalid binary index."));
+            } else {
+                maybe_bin_ref = Some(index as usize);
+                break;
+            }
+        }
+    }
+
+    if let Some(bin_ref) = maybe_bin_ref {
+        if let Some(ref binary) = kdbx.binaries.get(bin_ref) {
+            Ok((*binary).clone())
+        } else {
+            return Err(Error::BadFormat("Invalid binary index."));
+        }
+    } else {
+        if let Some(xb) = xml_process_node(kdbx, xml, elem)? {
+            debug_assert!(!compressed, "Binary cannot be encrypted and compressed at the same time.");
+            let mut pb_vec = Vec::new();
+            xb.plaintext_vec(&mut pb_vec);
+            Ok(ProtectedBinary::wrap(pb_vec))
+        } else {
+            let data = xml_read_base64(kdbx, xml, elem, true)?;
+            if data.len() == 0 {
+                Ok(ProtectedBinary::empty())
+            } else {
+                if compressed {
+                    Ok(ProtectedBinary::wrap(memutil::decompress(&data)?))
+                } else {
+                    Ok(ProtectedBinary::wrap(data))
+                }
+            }
+        }
+    }
+}
+
+fn xml_read_protected_string<R: Read>(kdbx: &mut Kdbx, xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<ProtectedString, Error> {
+    if let Some(buf) = xml_process_node(kdbx, xml, elem)? {
+        let mut pbuf = Vec::new();
+        buf.plaintext_vec(&mut pbuf);
+        Ok(ProtectedString::wrap(String::from_utf8(pbuf).map_err(|_| Error::BadFormat("Invalid UTF8 string."))?))
+    } else {
+        Ok(ProtectedString::wrap(xml_read_string(kdbx, xml, elem)?))
+    }
+}
+fn xml_read_icon_id<R: Read>(kdbx: &mut Kdbx, xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<Option<PwIcon>, Error> {
+    let i = xml_read_int(kdbx, xml, elem)?.unwrap_or(-1);
+
+    if i > 0 {
+        Ok(PwIcon::from_int(i as u32))
+    } else {
+        Ok(None)
+    }
+}
+
+fn xml_read_uuid<R: Read>(kdbx: &mut Kdbx, xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<PwUUID, Error> {
+    let b = xml_read_base64(kdbx, xml, elem, false)?;
+
+    // @TODO check if I should be doing this or not. At the moment I just zero extend the buffer if
+    // it's too small and truncate it if it's too large.
+    if b.len() < PwUUID::SIZE {
+        let mut b2 = [0u8; PwUUID::SIZE];
+        (&mut b2[0..b.len()]).copy_from_slice(&b);
+        Ok(PwUUID::wrap(b2))
+    } else {
+        Ok(PwUUID::from_slice(&b))
+    }
+}
+
+fn xml_read_bool<R: Read>(kdbx: &mut Kdbx, xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<Option<bool>, Error> {
+    match (xml_read_string(kdbx, xml, elem)?).as_str() {
+        VAL_TRUE => Ok(Some(true)),
+        VAL_FALSE => Ok(Some(false)),
+        _ => Ok(None),
+    }
+}
+
+fn xml_read_int<R: Read>(kdbx: &mut Kdbx, xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<Option<i32>, Error> {
+    Ok(xml_read_string(kdbx, xml, elem)?.parse::<i32>().ok())
+}
+
+fn xml_read_uint<R: Read>(kdbx: &mut Kdbx, xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<Option<u32>, Error> {
+    Ok(xml_read_string(kdbx, xml, elem)?.parse::<u32>().ok())
+}
+
+fn xml_read_long<R: Read>(kdbx: &mut Kdbx, xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<Option<i64>, Error> {
+    Ok(xml_read_string(kdbx, xml, elem)?.parse::<i64>().ok())
+}
+
+fn xml_read_ulong<R: Read>(kdbx: &mut Kdbx, xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<Option<u64>, Error> {
+    Ok(xml_read_string(kdbx, xml, elem)?.parse::<u64>().ok())
 }
 
 fn xml_read_time<R: Read>(kdbx: &mut Kdbx, xml: &mut EventReader<R>, elem: &XmlStartElement) -> Result<DateTime<Utc>, Error> {

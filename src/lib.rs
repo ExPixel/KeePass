@@ -14,6 +14,7 @@ macro_rules! debug_println {
 pub mod error;
 pub mod database;
 mod memutil;
+mod strutil;
 mod ioutil;
 pub mod kdbx;
 pub mod vdict;

@@ -70,6 +70,10 @@ pub struct ProtectedString {
 }
 
 impl ProtectedString {
+    pub fn empty() -> ProtectedString {
+        Self::wrap(String::new())
+    }
+
     pub fn wrap(value: String) -> ProtectedString {
         ProtectedString {
             inner: value
@@ -116,12 +120,6 @@ impl ProtectedBinary {
         Self::wrap(Vec::with_capacity(0))
     }
 
-    pub fn new(len: usize) -> ProtectedBinary {
-        let mut v = Vec::new();
-        v.resize(len, 0);
-        Self::wrap(v)
-    }
-
     pub fn copy_slice(src: &[u8]) -> ProtectedBinary {
         let mut v = Vec::with_capacity(src.len());
         for b in src.iter() {
@@ -144,22 +142,22 @@ impl ProtectedBinary {
         &mut this.inner
     }
 
-    /// Copies some data into a protected binary.
-    pub fn copy_into(this: &mut ProtectedBinary, offset: usize, src: &[u8]) {
-        assert!(offset < this.len(), "offset is out of bounds");
+    // /// Copies some data into a protected binary.
+    // pub fn copy_into(this: &mut ProtectedBinary, offset: usize, src: &[u8]) {
+    //     assert!(offset < this.len(), "offset is out of bounds");
 
-        let len = if src.len() < (this.len() - offset) {
-            src.len()
-        } else {
-            this.len() - offset
-        };
+    //     let len = if src.len() < (this.len() - offset) {
+    //         src.len()
+    //     } else {
+    //         this.len() - offset
+    //     };
 
-        for idx in 0..len {
-            unsafe {
-                *(Self::get_mut(this).get_unchecked_mut(idx + offset)) = *src.get_unchecked(idx);
-            }
-        }
-    }
+    //     for idx in 0..len {
+    //         unsafe {
+    //             *(Self::get_mut(this).get_unchecked_mut(idx + offset)) = *src.get_unchecked(idx);
+    //         }
+    //     }
+    // }
 }
 
 impl Drop for ProtectedBinary {
