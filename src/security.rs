@@ -80,7 +80,7 @@ impl ProtectedString {
         }
     }
 
-    pub fn get(this: &ProtectedString) -> &String {
+    pub fn get(this: &ProtectedString) -> &str {
         &this.inner
     }
 
