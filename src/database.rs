@@ -298,8 +298,6 @@ impl PwGroup {
         }
 
         this.borrow_mut().entries.push(entry);
-
-        println!("ADDED ENTRY TO GROUP>");
     }
 
     pub fn add_group(this: &Rc<RefCell<Self>>, sub_group: Rc<RefCell<PwGroup>>, take_ownership: bool, update_location_changed_of_entry: bool) {
