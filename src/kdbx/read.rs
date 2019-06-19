@@ -655,6 +655,8 @@ fn read_start_xml_element<R: Read>(database: &mut PwDatabase, kdbx: &mut Kdbx, c
                     return Err(Error::BadFormat("No history base."));
                 }
                 kdbx.ctx_entry = Some(entry);
+                kdbx.entry_in_history = true;
+                return Ok(KdbContext::Entry);
             } else {
                 xml_read_unknown(kdbx, xml, &elem)?
             }
@@ -754,6 +756,7 @@ fn read_end_xml_element<R: Read>(database: &mut PwDatabase, kdbx: &mut Kdbx, ctx
 
             if kdbx.entry_in_history {
                 kdbx.ctx_entry = kdbx.ctx_history_base.as_ref().map(Rc::clone);
+                return Ok(KdbContext::EntryHistory);
             }
 
             return Ok(KdbContext::Group);
