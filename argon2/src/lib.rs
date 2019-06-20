@@ -1,21 +1,22 @@
+//! Thin wrapper for the Argon2 C library.
+//! All public argon2 functions are mapped to functions with the `argon2` prefix
+//! and any leftover underscores after the prefix removed.
+//! e.g. `argon2_ctx` -> `ctx` and `argon2i_ctx` -> `i_ctx`
+
 #[allow(bad_style, dead_code)]
-pub mod sys;
+mod sys;
+mod types;
 
 use std::convert::TryInto;
+use std::ffi::CStr;
+use types::{opt_slice_ptr_mut, opt_slice_len, opt_slice_ptr};
 
-/// Function that performs memory-hard hashing with certain degree of parallelism.
-pub fn ctx<C: TryInto<sys::Argon2_Context, Error = self::Error>>(context: C, variant: Variant) -> Result<(), Error> {
-    unsafe {
-        Error::check_code(sys::argon2_ctx(&mut context.try_into()?, variant.to_c()) as _)
-    }
-}
+pub use self::types::*;
 
 /// Function that gives the string representation of an argon2 Variant.
 /// If the `uppercase` parameter is true, the name of the variant is returned with the first letter
 /// uppercased.
 pub fn type2string(variant: Variant, uppercase: bool) -> &'static str {
-    use std::ffi::CStr;
-
     unsafe {
         let uppercase_i = if uppercase { 1 } else { 0 };
         let str_ptr = sys::argon2_type2string(variant.to_c(), uppercase_i);
@@ -25,421 +26,537 @@ pub fn type2string(variant: Variant, uppercase: bool) -> &'static str {
     }
 }
 
-#[derive(Debug)]
-pub enum Error {
-    /// This error is returned whenever a bad parameter is passed in but doesn't make it past the
-    /// wrapper layer. e.g. a parameter that cannot be converted to the type required by the argon2
-    /// C library.
-    BadParam(&'static str),
-
-    /// An error returned from the argon2 C library in the form of an error code.
-    Code(ErrorCode),
+/// Function that performs memory-hard hashing with certain degree of parallelism.
+pub fn ctx<C: TryInto<sys::Argon2_Context, Error = self::Error>>(context: C, variant: Variant) -> Result<(), Error> {
+    unsafe {
+        Error::check_code(sys::argon2_ctx(&mut context.try_into()?, variant.to_c()) as _)
+    }
 }
 
-impl Error {
-    fn check_code(code: sys::Argon2_ErrorCodes) -> Result<(), Error> {
-        if let Some(err_code) = ErrorCode::from_c(code as sys::Argon2_ErrorCodes) {
-            Err(Error::Code(err_code))
+/// Argon2d: Version of Argon2 that picks memory blocks depending on the password and salt. Only
+/// for side-channel-free environment!!
+pub fn d_ctx<C: TryInto<sys::Argon2_Context, Error = self::Error>>(context: C) -> Result<(), Error> {
+    unsafe {
+        Error::check_code(sys::argon2d_ctx(&mut context.try_into()?))
+    }
+}
+
+/// Argon2i: Version of Argon2 that picks memory blocks
+/// independent on the password and salt. Good for side-channels,
+/// but worse with respect to tradeoff attacks if only one pass is used.
+pub fn i_ctx<C: TryInto<sys::Argon2_Context, Error = self::Error>>(context: C) -> Result<(), Error> {
+    unsafe {
+        Error::check_code(sys::argon2i_ctx(&mut context.try_into()?))
+    }
+}
+
+/// Argon2id: Version of Argon2 where the first half-pass over memory is
+/// password-independent, the rest are password-dependent (on the password and
+/// salt). OK against side channels (they reduce to 1/2-pass Argon2i), and
+/// better with respect to tradeoff attacks (similar to Argon2d).
+pub fn id_ctx<C: TryInto<sys::Argon2_Context, Error = self::Error>>(context: C) -> Result<(), Error> {
+    unsafe {
+        Error::check_code(sys::argon2id_ctx(&mut context.try_into()?))
+    }
+}
+
+/// Hashes a password with Argon2i, producing an encoded (string) hash.
+///
+/// # Parameters
+/// - `t_cost`: Number of iterations
+/// - `m_cost`: Sets memory usage to m_cost kibibytes
+/// - `parallelism`: Number of threads and compute lanes
+/// - `pwd`: Slice containing the password.
+/// - `salt`: Slice containing the salt.
+/// - `hashlen`: Desired length of the hash in bytes.
+/// - `encoded`: Buffer where to write the encoded hash.
+///
+/// # Notes
+///
+/// - The different parallelism levels will give different results.
+pub fn i_hash_encoded(
+    t_cost: u32,
+    m_cost: u32,
+    parallelism: u32,
+    pwd: Option<&[u8]>,
+    salt: Option<&[u8]>,
+    hashlen: usize,
+    encoded: &mut [u8]) -> Result<(), Error> {
+    unsafe {
+        Error::check_code(
+            sys::argon2i_hash_encoded(
+                t_cost, m_cost, parallelism,
+                opt_slice_ptr(&pwd) as _,
+                opt_slice_len(&pwd),
+                opt_slice_ptr(&salt) as _,
+                opt_slice_len(&salt),
+                hashlen,
+                encoded.as_mut_ptr() as _,
+                encoded.len(),
+            )
+        )
+    }
+}
+
+/// Hashes a password with Argon2i, producing a raw hash.
+///
+/// # Parameters
+/// - `t_cost`: Number of iterations
+/// - `m_cost`: Sets memory usage to m_cost kibibytes
+/// - `parallelism`: Number of threads and compute lanes
+/// - `pwd`: Slice containing the password.
+/// - `salt`: Slice containing the salt.
+/// - `hash`: Buffer where to write the raw hash.
+///
+/// # Notes
+///
+/// - The different parallelism levels will give different results.
+pub fn i_hash_raw(
+    t_cost: u32,
+    m_cost: u32,
+    parallelism: u32,
+    pwd: Option<&[u8]>,
+    salt: Option<&[u8]>,
+    hash: &mut [u8]) -> Result<(), Error> {
+    unsafe {
+        Error::check_code(
+            sys::argon2i_hash_raw(
+                t_cost, m_cost, parallelism,
+                opt_slice_ptr(&pwd) as _,
+                opt_slice_len(&pwd),
+                opt_slice_ptr(&salt) as _,
+                opt_slice_len(&salt),
+                hash.as_mut_ptr() as _,
+                hash.len(),
+            )
+        )
+    }
+}
+
+/// Hashes a password with Argon2d, producing an encoded (string) hash.
+///
+/// # Parameters
+/// - `t_cost`: Number of iterations
+/// - `m_cost`: Sets memory usage to m_cost kibibytes
+/// - `parallelism`: Number of threads and compute lanes
+/// - `pwd`: Slice containing the password.
+/// - `salt`: Slice containing the salt.
+/// - `hashlen`: Desired length of the hash in bytes.
+/// - `encoded`: Buffer where to write the encoded hash.
+///
+/// # Notes
+///
+/// - The different parallelism levels will give different results.
+pub fn d_hash_encoded(
+    t_cost: u32,
+    m_cost: u32,
+    parallelism: u32,
+    pwd: Option<&[u8]>,
+    salt: Option<&[u8]>,
+    hashlen: usize,
+    encoded: &mut [u8]) -> Result<(), Error> {
+    unsafe {
+        Error::check_code(
+            sys::argon2d_hash_encoded(
+                t_cost, m_cost, parallelism,
+                opt_slice_ptr(&pwd) as _,
+                opt_slice_len(&pwd),
+                opt_slice_ptr(&salt) as _,
+                opt_slice_len(&salt),
+                hashlen,
+                encoded.as_mut_ptr() as _,
+                encoded.len(),
+            )
+        )
+    }
+}
+
+/// Hashes a password with Argon2d, producing a raw hash.
+///
+/// # Parameters
+/// - `t_cost`: Number of iterations
+/// - `m_cost`: Sets memory usage to m_cost kibibytes
+/// - `parallelism`: Number of threads and compute lanes
+/// - `pwd`: Slice containing the password.
+/// - `salt`: Slice containing the salt.
+/// - `hash`: Buffer where to write the raw hash.
+///
+/// # Notes
+///
+/// - The different parallelism levels will give different results.
+pub fn d_hash_raw(
+    t_cost: u32,
+    m_cost: u32,
+    parallelism: u32,
+    pwd: Option<&[u8]>,
+    salt: Option<&[u8]>,
+    hash: &mut [u8]) -> Result<(), Error> {
+    unsafe {
+        Error::check_code(
+            sys::argon2d_hash_raw(
+                t_cost, m_cost, parallelism,
+                opt_slice_ptr(&pwd) as _,
+                opt_slice_len(&pwd),
+                opt_slice_ptr(&salt) as _,
+                opt_slice_len(&salt),
+                hash.as_mut_ptr() as _,
+                hash.len(),
+            )
+        )
+    }
+}
+
+/// Hashes a password with Argon2id, producing an encoded (string) hash.
+///
+/// # Parameters
+/// - `t_cost`: Number of iterations
+/// - `m_cost`: Sets memory usage to m_cost kibibytes
+/// - `parallelism`: Number of threads and compute lanes
+/// - `pwd`: Slice containing the password.
+/// - `salt`: Slice containing the salt.
+/// - `hashlen`: Desired length of the hash in bytes.
+/// - `encoded`: Buffer where to write the encoded hash.
+///
+/// # Notes
+///
+/// - The different parallelism levels will give different results.
+pub fn id_hash_encoded(
+    t_cost: u32,
+    m_cost: u32,
+    parallelism: u32,
+    pwd: Option<&[u8]>,
+    salt: Option<&[u8]>,
+    hashlen: usize,
+    encoded: &mut [u8]) -> Result<(), Error> {
+    unsafe {
+        Error::check_code(
+            sys::argon2id_hash_encoded(
+                t_cost, m_cost, parallelism,
+                opt_slice_ptr(&pwd) as _,
+                opt_slice_len(&pwd),
+                opt_slice_ptr(&salt) as _,
+                opt_slice_len(&salt),
+                hashlen,
+                encoded.as_mut_ptr() as _,
+                encoded.len(),
+            )
+        )
+    }
+}
+
+/// Hashes a password with Argon2id, producing a raw hash.
+///
+/// # Parameters
+/// - `t_cost`: Number of iterations
+/// - `m_cost`: Sets memory usage to m_cost kibibytes
+/// - `parallelism`: Number of threads and compute lanes
+/// - `pwd`: Slice containing the password.
+/// - `salt`: Slice containing the salt.
+/// - `hash`: Buffer where to write the raw hash.
+///
+/// # Notes
+///
+/// - The different parallelism levels will give different results.
+pub fn id_hash_raw(
+    t_cost: u32,
+    m_cost: u32,
+    parallelism: u32,
+    pwd: Option<&[u8]>,
+    salt: Option<&[u8]>,
+    hash: &mut [u8]) -> Result<(), Error> {
+    unsafe {
+        Error::check_code(
+            sys::argon2id_hash_raw(
+                t_cost, m_cost, parallelism,
+                opt_slice_ptr(&pwd) as _,
+                opt_slice_len(&pwd),
+                opt_slice_ptr(&salt) as _,
+                opt_slice_len(&salt),
+                hash.as_mut_ptr() as _,
+                hash.len(),
+            )
+        )
+    }
+}
+
+/// Generic Argon2 hash function.
+///
+/// # Parameters
+/// - `t_cost`: Number of iterations
+/// - `m_cost`: Sets memory usage to m_cost kibibytes
+/// - `parallelism`: Number of threads and compute lanes
+/// - `pwd`: Slice containing the password.
+/// - `salt`: Slice containing the salt.
+/// - `hash`: Buffer where to write the raw hash.
+/// - `encoded`: Buffer where to write the encoded hash (as a string).
+/// - `variant`: The variant (type) of Argon2 to use.
+/// - `version`: The version of the Argon2 algorithm to use.
+///
+/// # Notes
+///
+/// - The different parallelism levels will give different results.
+pub fn hash(
+    t_cost: u32,
+    m_cost: u32,
+    parallelism: u32,
+    pwd: Option<&[u8]>,
+    salt: Option<&[u8]>,
+    mut hash: Option<&mut [u8]>,
+    mut encoded: Option<&mut [u8]>,
+    variant: Variant,
+    version: Version) -> Result<(), Error> {
+    unsafe {
+        Error::check_code(
+            sys::argon2_hash(
+                t_cost, m_cost, parallelism,
+                opt_slice_ptr(&pwd) as _,
+                opt_slice_len(&pwd),
+                opt_slice_ptr(&salt) as _,
+                opt_slice_len(&salt),
+                opt_slice_ptr_mut(&mut hash) as _,
+                opt_slice_len(&hash),
+                opt_slice_ptr_mut(&mut encoded) as _,
+                opt_slice_len(&encoded),
+                variant.to_c() as _,
+                version.to_c() as _,
+            )
+        )
+    }
+}
+
+/// Verifies a password against an encoded string using Argon2i.
+///
+/// # Parameters
+/// - `encoded`: String encoding parameters, salt, hash.
+/// - `pwd`: Slice containing password.
+pub fn i_verify(encoded: &CStr, pwd: Option<&[u8]>) -> Result<(), Error> {
+    unsafe {
+        Error::check_code(
+            sys::argon2i_verify(
+                encoded.as_ptr() as _,
+                opt_slice_ptr(&pwd) as _,
+                opt_slice_len(&pwd),
+            )
+        )
+    }
+}
+
+/// Verifies a password against an encoded string using Argon2d.
+///
+/// # Parameters
+/// - `encoded`: String encoding parameters, salt, hash.
+/// - `pwd`: Slice containing password.
+pub fn d_verify(encoded: &CStr, pwd: Option<&[u8]>) -> Result<(), Error> {
+    unsafe {
+        Error::check_code(
+            sys::argon2d_verify(
+                encoded.as_ptr() as _,
+                opt_slice_ptr(&pwd) as _,
+                opt_slice_len(&pwd),
+            )
+        )
+    }
+}
+
+/// Verifies a password against an encoded string using Argon2id.
+///
+/// # Parameters
+/// - `encoded`: String encoding parameters, salt, hash.
+/// - `pwd`: Slice containing password.
+pub fn id_verify(encoded: &CStr, pwd: Option<&[u8]>) -> Result<(), Error> {
+    unsafe {
+        Error::check_code(
+            sys::argon2id_verify(
+                encoded.as_ptr() as _,
+                opt_slice_ptr(&pwd) as _,
+                opt_slice_len(&pwd),
+            )
+        )
+    }
+}
+
+/// Verifies a password against an encoded string.
+///
+/// # Parameters
+/// - `encoded`: String encoding parameters, salt, hash.
+/// - `pwd`: Slice containing password.
+pub fn verify(encoded: &CStr, pwd: Option<&[u8]>, variant: Variant) -> Result<(), Error> {
+    unsafe {
+        Error::check_code(
+            sys::argon2_verify(
+                encoded.as_ptr() as _,
+                opt_slice_ptr(&pwd) as _,
+                opt_slice_len(&pwd),
+                variant.to_c() as _,
+            )
+        )
+    }
+}
+
+/// Verify if a given password is correct for Argon2d hashing.
+///
+/// # Parameters
+///
+/// - `context`: The current Argon2 context.
+/// - `hash`: The password hash to verify. The length of the hash must match the length of the out
+/// parameter in context.
+pub fn d_verify_ctx<C: TryInto<sys::Argon2_Context, Error = self::Error>>(context: C, hash: &[u8]) -> Result<(), Error> {
+
+    let mut argon_context = context.try_into()?;
+    if hash.len() as u32 != argon_context.outlen {
+        return Err(Error::BadParam("hash.len"))
+    }
+
+    unsafe {
+        Error::check_code(
+            sys::argon2d_verify_ctx(
+                &mut argon_context,
+                hash.as_ptr() as _,
+            )
+        )
+    }
+}
+
+/// Verify if a given password is correct for Argon2i hashing.
+///
+/// # Parameters
+///
+/// - `context`: The current Argon2 context.
+/// - `hash`: The password hash to verify. The length of the hash must match the length of the out
+/// parameter in context.
+pub fn i_verify_ctx<C: TryInto<sys::Argon2_Context, Error = self::Error>>(context: C, hash: &[u8]) -> Result<(), Error> {
+
+    let mut argon_context = context.try_into()?;
+    if hash.len() as u32 != argon_context.outlen {
+        return Err(Error::BadParam("hash.len"))
+    }
+
+    unsafe {
+        Error::check_code(
+            sys::argon2i_verify_ctx(
+                &mut argon_context,
+                hash.as_ptr() as _,
+            )
+        )
+    }
+}
+
+/// Verify if a given password is correct for Argon2id hashing.
+///
+/// # Parameters
+///
+/// - `context`: The current Argon2 context.
+/// - `hash`: The password hash to verify. The length of the hash must match the length of the out
+/// parameter in context.
+pub fn id_verify_ctx<C: TryInto<sys::Argon2_Context, Error = self::Error>>(context: C, hash: &[u8]) -> Result<(), Error> {
+
+    let mut argon_context = context.try_into()?;
+    if hash.len() as u32 != argon_context.outlen {
+        return Err(Error::BadParam("hash.len"))
+    }
+
+    unsafe {
+        Error::check_code(
+            sys::argon2id_verify_ctx(
+                &mut argon_context,
+                hash.as_ptr() as _,
+            )
+        )
+    }
+}
+
+/// Verify if a given password is correct for a given variant of Argon2 hashing.
+///
+/// # Parameters
+///
+/// - `context`: The current Argon2 context.
+/// - `hash`: The password hash to verify. The length of the hash must match the length of the out
+/// parameter in context.
+pub fn verify_ctx<C: TryInto<sys::Argon2_Context, Error = self::Error>>(context: C, hash: &[u8], variant: Variant) -> Result<(), Error> {
+
+    let mut argon_context = context.try_into()?;
+    if hash.len() as u32 != argon_context.outlen {
+        return Err(Error::BadParam("hash.len"))
+    }
+
+    unsafe {
+        Error::check_code(
+            sys::argon2_verify_ctx(
+                &mut argon_context,
+                hash.as_ptr() as _,
+                variant.to_c() as _,
+            )
+        )
+    }
+}
+
+/// Get the associated error message for a given error code.
+pub fn error_message(code: ErrorCode) -> Option<&'static str> {
+    unsafe {
+        let str_ptr = sys::argon2_error_message(code.to_c());
+        if str_ptr.is_null() {
+            None
         } else {
-            Ok(())
+            let str_cstr = CStr::from_ptr(str_ptr);
+            Some(str_cstr.to_str().expect("Variant name is not valid UTF-8"))
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-#[repr(i32)]
-pub enum ErrorCode {
-    OutputPtrNull = sys::Argon2_ErrorCodes_ARGON2_OUTPUT_PTR_NULL,
-    OutputTooShort = sys::Argon2_ErrorCodes_ARGON2_OUTPUT_TOO_SHORT,
-    OutputTooLong = sys::Argon2_ErrorCodes_ARGON2_OUTPUT_TOO_LONG,
-    PwdTooShort = sys::Argon2_ErrorCodes_ARGON2_PWD_TOO_SHORT,
-    PwdTooLong = sys::Argon2_ErrorCodes_ARGON2_PWD_TOO_LONG,
-    SaltTooShort = sys::Argon2_ErrorCodes_ARGON2_SALT_TOO_SHORT,
-    SaltTooLong = sys::Argon2_ErrorCodes_ARGON2_SALT_TOO_LONG,
-    AdTooShort = sys::Argon2_ErrorCodes_ARGON2_AD_TOO_SHORT,
-    AdTooLong = sys::Argon2_ErrorCodes_ARGON2_AD_TOO_LONG,
-    SecretTooShort = sys::Argon2_ErrorCodes_ARGON2_SECRET_TOO_SHORT,
-    SecretTooLong = sys::Argon2_ErrorCodes_ARGON2_SECRET_TOO_LONG,
-    TimeTooSmall = sys::Argon2_ErrorCodes_ARGON2_TIME_TOO_SMALL,
-    TimeTooLarge = sys::Argon2_ErrorCodes_ARGON2_TIME_TOO_LARGE,
-    MemoryTooLittle = sys::Argon2_ErrorCodes_ARGON2_MEMORY_TOO_LITTLE,
-    MemoryTooMuch = sys::Argon2_ErrorCodes_ARGON2_MEMORY_TOO_MUCH,
-    LanesTooFew = sys::Argon2_ErrorCodes_ARGON2_LANES_TOO_FEW,
-    LanesTooMany = sys::Argon2_ErrorCodes_ARGON2_LANES_TOO_MANY,
-    PwdPtrMismatch = sys::Argon2_ErrorCodes_ARGON2_PWD_PTR_MISMATCH,
-    SaltPtrMismatch = sys::Argon2_ErrorCodes_ARGON2_SALT_PTR_MISMATCH,
-    SecretPtrMismatch = sys::Argon2_ErrorCodes_ARGON2_SECRET_PTR_MISMATCH,
-    AdPtrMismatch = sys::Argon2_ErrorCodes_ARGON2_AD_PTR_MISMATCH,
-    MemoryAllocationError = sys::Argon2_ErrorCodes_ARGON2_MEMORY_ALLOCATION_ERROR,
-    FreeMemoryCbkNull = sys::Argon2_ErrorCodes_ARGON2_FREE_MEMORY_CBK_NULL,
-    AllocateMemoryCbkNull = sys::Argon2_ErrorCodes_ARGON2_ALLOCATE_MEMORY_CBK_NULL,
-    IncorrectParameter = sys::Argon2_ErrorCodes_ARGON2_INCORRECT_PARAMETER,
-    IncorrectType = sys::Argon2_ErrorCodes_ARGON2_INCORRECT_TYPE,
-    OutPtrMismatch = sys::Argon2_ErrorCodes_ARGON2_OUT_PTR_MISMATCH,
-    ThreadsTooFew = sys::Argon2_ErrorCodes_ARGON2_THREADS_TOO_FEW,
-    ThreadsTooMany = sys::Argon2_ErrorCodes_ARGON2_THREADS_TOO_MANY,
-    MissingArgs = sys::Argon2_ErrorCodes_ARGON2_MISSING_ARGS,
-    EncodingFail = sys::Argon2_ErrorCodes_ARGON2_ENCODING_FAIL,
-    DecodingFail = sys::Argon2_ErrorCodes_ARGON2_DECODING_FAIL,
-    ThreadFail = sys::Argon2_ErrorCodes_ARGON2_THREAD_FAIL,
-    DecodingLengthFail = sys::Argon2_ErrorCodes_ARGON2_DECODING_LENGTH_FAIL,
-    VerifyMismatch = sys::Argon2_ErrorCodes_ARGON2_VERIFY_MISMATCH,
+/// Returns the encoded hash length for the given input parameters.
+///
+/// # Parameters
+/// `t_cost`: Number of iterations.
+/// `m_cost`: Memory usage in kibibytes.
+/// `parallelism`: Number of threads; used to compute lanes.
+/// `saltlen`: Salt size in bytes.
+/// `hashlen`: Hash size in bytes.
+/// `variant`: The Argon2 Variant that we want the encoded length for.
+///
+/// # Returns
+///
+/// The encoded hash length in bytes.
+pub fn encodedlen(
+    t_cost: u32,
+    m_cost: u32,
+    parallelism: u32,
+    saltlen: u32,
+    hashlen: u32,
+    variant: Variant) -> usize {
+    unsafe {
+        sys::argon2_encodedlen(t_cost, m_cost, parallelism, saltlen, hashlen, variant.to_c() as _)
+    }
 }
 
-impl ErrorCode {
-    /// Converts an Argon2 error code into a Rust representation.
-    fn from_c(c_error_code: sys::Argon2_ErrorCodes) -> Option<ErrorCode> {
-        match c_error_code {
-            sys::Argon2_ErrorCodes_ARGON2_OUTPUT_PTR_NULL => Some(ErrorCode::OutputPtrNull),
-            sys::Argon2_ErrorCodes_ARGON2_OUTPUT_TOO_SHORT => Some(ErrorCode::OutputTooShort),
-            sys::Argon2_ErrorCodes_ARGON2_OUTPUT_TOO_LONG => Some(ErrorCode::OutputTooLong),
-            sys::Argon2_ErrorCodes_ARGON2_PWD_TOO_SHORT => Some(ErrorCode::PwdTooShort),
-            sys::Argon2_ErrorCodes_ARGON2_PWD_TOO_LONG => Some(ErrorCode::PwdTooLong),
-            sys::Argon2_ErrorCodes_ARGON2_SALT_TOO_SHORT => Some(ErrorCode::SaltTooShort),
-            sys::Argon2_ErrorCodes_ARGON2_SALT_TOO_LONG => Some(ErrorCode::SaltTooLong),
-            sys::Argon2_ErrorCodes_ARGON2_AD_TOO_SHORT => Some(ErrorCode::AdTooShort),
-            sys::Argon2_ErrorCodes_ARGON2_AD_TOO_LONG => Some(ErrorCode::AdTooLong),
-            sys::Argon2_ErrorCodes_ARGON2_SECRET_TOO_SHORT => Some(ErrorCode::SecretTooShort),
-            sys::Argon2_ErrorCodes_ARGON2_SECRET_TOO_LONG => Some(ErrorCode::SecretTooLong),
-            sys::Argon2_ErrorCodes_ARGON2_TIME_TOO_SMALL => Some(ErrorCode::TimeTooSmall),
-            sys::Argon2_ErrorCodes_ARGON2_TIME_TOO_LARGE => Some(ErrorCode::TimeTooLarge),
-            sys::Argon2_ErrorCodes_ARGON2_MEMORY_TOO_LITTLE => Some(ErrorCode::MemoryTooLittle),
-            sys::Argon2_ErrorCodes_ARGON2_MEMORY_TOO_MUCH => Some(ErrorCode::MemoryTooMuch),
-            sys::Argon2_ErrorCodes_ARGON2_LANES_TOO_FEW => Some(ErrorCode::LanesTooFew),
-            sys::Argon2_ErrorCodes_ARGON2_LANES_TOO_MANY => Some(ErrorCode::LanesTooMany),
-            sys::Argon2_ErrorCodes_ARGON2_PWD_PTR_MISMATCH => Some(ErrorCode::PwdPtrMismatch),
-            sys::Argon2_ErrorCodes_ARGON2_SALT_PTR_MISMATCH => Some(ErrorCode::SaltPtrMismatch),
-            sys::Argon2_ErrorCodes_ARGON2_SECRET_PTR_MISMATCH => Some(ErrorCode::SecretPtrMismatch),
-            sys::Argon2_ErrorCodes_ARGON2_AD_PTR_MISMATCH => Some(ErrorCode::AdPtrMismatch),
-            sys::Argon2_ErrorCodes_ARGON2_MEMORY_ALLOCATION_ERROR => Some(ErrorCode::MemoryAllocationError),
-            sys::Argon2_ErrorCodes_ARGON2_FREE_MEMORY_CBK_NULL => Some(ErrorCode::FreeMemoryCbkNull),
-            sys::Argon2_ErrorCodes_ARGON2_ALLOCATE_MEMORY_CBK_NULL => Some(ErrorCode::AllocateMemoryCbkNull),
-            sys::Argon2_ErrorCodes_ARGON2_INCORRECT_PARAMETER => Some(ErrorCode::IncorrectParameter),
-            sys::Argon2_ErrorCodes_ARGON2_INCORRECT_TYPE => Some(ErrorCode::IncorrectType),
-            sys::Argon2_ErrorCodes_ARGON2_OUT_PTR_MISMATCH => Some(ErrorCode::OutPtrMismatch),
-            sys::Argon2_ErrorCodes_ARGON2_THREADS_TOO_FEW => Some(ErrorCode::ThreadsTooFew),
-            sys::Argon2_ErrorCodes_ARGON2_THREADS_TOO_MANY => Some(ErrorCode::ThreadsTooMany),
-            sys::Argon2_ErrorCodes_ARGON2_MISSING_ARGS => Some(ErrorCode::MissingArgs),
-            sys::Argon2_ErrorCodes_ARGON2_ENCODING_FAIL => Some(ErrorCode::EncodingFail),
-            sys::Argon2_ErrorCodes_ARGON2_DECODING_FAIL => Some(ErrorCode::DecodingFail),
-            sys::Argon2_ErrorCodes_ARGON2_THREAD_FAIL => Some(ErrorCode::ThreadFail),
-            sys::Argon2_ErrorCodes_ARGON2_DECODING_LENGTH_FAIL => Some(ErrorCode::DecodingLengthFail),
-            sys::Argon2_ErrorCodes_ARGON2_VERIFY_MISMATCH => Some(ErrorCode::VerifyMismatch),
+/// Converts a slice of bytes to a CStr.
+/// Unlike CStr::from_bytes_with_nul this will stop at the first
+/// null byte instead of returning an error for interior null bytes.
+/// This will return an error if there are no null bytes at all.
+pub fn c_str(bytes: &[u8]) -> Result<&CStr, Error> {
+    for (idx, b) in bytes.iter().enumerate() {
+        if *b == 0 {
+            return Ok(CStr::from_bytes_with_nul(&bytes[0..(idx + 1)]).expect("Failed CStr conversion."));
+        }
+    }
+    Err(Error::BadParam("bytes"))
+}
 
-            _ => None,
+/// Converts a slice of bytes to a CStr much like `c_str` except this will allocate a C string for
+/// you instead with a terminating null byte if one cannot be found inside of the given byte
+/// string.
+pub fn c_str_cow<'a>(bytes: &'a [u8]) -> std::borrow::Cow<'a, CStr> {
+    for (idx, b) in bytes.iter().enumerate() {
+        if *b == 0 {
+            return std::borrow::Cow::Borrowed(
+                CStr::from_bytes_with_nul(&bytes[0..(idx + 1)])
+                .expect("Failed CStr conversion.")
+            );
         }
     }
 
-    /// Converts a Rust representation of an Argon2 error code into the C error code.
-    fn to_c(self: ErrorCode) -> sys::Argon2_ErrorCodes {
-        match self {
-            ErrorCode::OutputPtrNull => sys::Argon2_ErrorCodes_ARGON2_OUTPUT_PTR_NULL,
-            ErrorCode::OutputTooShort => sys::Argon2_ErrorCodes_ARGON2_OUTPUT_TOO_SHORT,
-            ErrorCode::OutputTooLong => sys::Argon2_ErrorCodes_ARGON2_OUTPUT_TOO_LONG,
-            ErrorCode::PwdTooShort => sys::Argon2_ErrorCodes_ARGON2_PWD_TOO_SHORT,
-            ErrorCode::PwdTooLong => sys::Argon2_ErrorCodes_ARGON2_PWD_TOO_LONG,
-            ErrorCode::SaltTooShort => sys::Argon2_ErrorCodes_ARGON2_SALT_TOO_SHORT,
-            ErrorCode::SaltTooLong => sys::Argon2_ErrorCodes_ARGON2_SALT_TOO_LONG,
-            ErrorCode::AdTooShort => sys::Argon2_ErrorCodes_ARGON2_AD_TOO_SHORT,
-            ErrorCode::AdTooLong => sys::Argon2_ErrorCodes_ARGON2_AD_TOO_LONG,
-            ErrorCode::SecretTooShort => sys::Argon2_ErrorCodes_ARGON2_SECRET_TOO_SHORT,
-            ErrorCode::SecretTooLong => sys::Argon2_ErrorCodes_ARGON2_SECRET_TOO_LONG,
-            ErrorCode::TimeTooSmall => sys::Argon2_ErrorCodes_ARGON2_TIME_TOO_SMALL,
-            ErrorCode::TimeTooLarge => sys::Argon2_ErrorCodes_ARGON2_TIME_TOO_LARGE,
-            ErrorCode::MemoryTooLittle => sys::Argon2_ErrorCodes_ARGON2_MEMORY_TOO_LITTLE,
-            ErrorCode::MemoryTooMuch => sys::Argon2_ErrorCodes_ARGON2_MEMORY_TOO_MUCH,
-            ErrorCode::LanesTooFew => sys::Argon2_ErrorCodes_ARGON2_LANES_TOO_FEW,
-            ErrorCode::LanesTooMany => sys::Argon2_ErrorCodes_ARGON2_LANES_TOO_MANY,
-            ErrorCode::PwdPtrMismatch => sys::Argon2_ErrorCodes_ARGON2_PWD_PTR_MISMATCH,
-            ErrorCode::SaltPtrMismatch => sys::Argon2_ErrorCodes_ARGON2_SALT_PTR_MISMATCH,
-            ErrorCode::SecretPtrMismatch => sys::Argon2_ErrorCodes_ARGON2_SECRET_PTR_MISMATCH,
-            ErrorCode::AdPtrMismatch => sys::Argon2_ErrorCodes_ARGON2_AD_PTR_MISMATCH,
-            ErrorCode::MemoryAllocationError => sys::Argon2_ErrorCodes_ARGON2_MEMORY_ALLOCATION_ERROR,
-            ErrorCode::FreeMemoryCbkNull => sys::Argon2_ErrorCodes_ARGON2_FREE_MEMORY_CBK_NULL,
-            ErrorCode::AllocateMemoryCbkNull => sys::Argon2_ErrorCodes_ARGON2_ALLOCATE_MEMORY_CBK_NULL,
-            ErrorCode::IncorrectParameter => sys::Argon2_ErrorCodes_ARGON2_INCORRECT_PARAMETER,
-            ErrorCode::IncorrectType => sys::Argon2_ErrorCodes_ARGON2_INCORRECT_TYPE,
-            ErrorCode::OutPtrMismatch => sys::Argon2_ErrorCodes_ARGON2_OUT_PTR_MISMATCH,
-            ErrorCode::ThreadsTooFew => sys::Argon2_ErrorCodes_ARGON2_THREADS_TOO_FEW,
-            ErrorCode::ThreadsTooMany => sys::Argon2_ErrorCodes_ARGON2_THREADS_TOO_MANY,
-            ErrorCode::MissingArgs => sys::Argon2_ErrorCodes_ARGON2_MISSING_ARGS,
-            ErrorCode::EncodingFail => sys::Argon2_ErrorCodes_ARGON2_ENCODING_FAIL,
-            ErrorCode::DecodingFail => sys::Argon2_ErrorCodes_ARGON2_DECODING_FAIL,
-            ErrorCode::ThreadFail => sys::Argon2_ErrorCodes_ARGON2_THREAD_FAIL,
-            ErrorCode::DecodingLengthFail => sys::Argon2_ErrorCodes_ARGON2_DECODING_LENGTH_FAIL,
-            ErrorCode::VerifyMismatch => sys::Argon2_ErrorCodes_ARGON2_VERIFY_MISMATCH,
-        }
-    }
-}
-
-/// Argon2 primitive type.
-#[derive(Debug, Clone, Copy)]
-pub enum Variant {
-    D   = 0,
-    I   = 1,
-    ID  = 2,
-}
-
-impl Variant {
-    /// Converts from the C Variant type to the Rust Variant Type.
-    #[inline]
-    fn from_c(c_variant: sys::Argon2_type) -> Variant {
-        match c_variant {
-            sys::Argon2_type_Argon2_d   => Variant::D,
-            sys::Argon2_type_Argon2_i   => Variant::I,
-            sys::Argon2_type_Argon2_id  => Variant::ID,
-            _ => panic!("Unimplemented version {}", c_variant),
-        }
-    }
-
-    /// Converts from the Rust Variant type to the C Variant Type.
-    #[inline]
-    fn to_c(self) -> sys::Argon2_type {
-        match self {
-            Variant::D  => sys::Argon2_type_Argon2_d,
-            Variant::I  => sys::Argon2_type_Argon2_i,
-            Variant::ID => sys::Argon2_type_Argon2_id,
-        }
-    }
-}
-
-/// Version of the algorithm.
-#[derive(Debug, Clone, Copy)]
-pub enum Version {
-    /// Argon2 Version 0x10
-    Version10 = 0x10,
-
-    /// Argon2 Version 0x13
-    Version13 = 0x13,
-}
-
-impl Version {
-    /// Converts the C version type to the Rust version type.
-    #[inline]
-    fn from_c(c_version: sys::Argon2_version) -> Version {
-        match c_version {
-            sys::Argon2_version_ARGON2_VERSION_10 => Version::Version10,
-            sys::Argon2_version_ARGON2_VERSION_13 => Version::Version13,
-            _ => panic!("Unimplemented version 0x{:X}", c_version),
-        }
-    }
-
-    /// Converts the Rust version type to the C version type.
-    #[inline]
-    fn to_c(self) -> sys::Argon2_version {
-        match self {
-            Version::Version10 => sys::Argon2_version_ARGON2_VERSION_10,
-            Version::Version13 => sys::Argon2_version_ARGON2_VERSION_13,
-        }
-    }
-}
-
-impl Default for Version {
-    /// Returns the latest version of the algorithm.
-    fn default() -> Version {
-        Version::Version13
-    }
-}
-
-bitflags::bitflags! {
-    pub struct Flags: u32 {
-        const DEFAULT           = 0;
-        const CLEAR_PASSWORD    = 1 << 0;
-        const CLEAR_SECRET      = 1 << 1;
-    }
-}
-
-/// Structure to hold Argon2 inputs.
-pub struct Context<'o, 'p, 'sa, 'se, 'ad> {
-    /// Output array.
-    pub out:    &'o mut [u8],
-    /// Password array.
-    pub pwd:    &'p mut [u8],
-    /// Salt array.
-    pub salt:   &'sa mut [u8],
-    /// Secret array.
-    pub secret: Option<&'se mut [u8]>,
-    /// Associated data array.
-    pub ad:     Option<&'ad mut [u8]>,
-
-    /// Number of passes.
-    pub t_cost: u32,
-    /// Amount of memory requested (KB)
-    pub m_cost: u32,
-    /// Number of lanes.
-    pub lanes:  u32,
-    /// Maximum number of threads.
-    pub threads:u32,
-
-    /// Version number.
-    pub version: Version,
-
-    /// Array of bool options
-    pub flags: Flags,
-}
-
-impl<'o, 'p, 'sa, 'se, 'ad> Context<'o, 'p, 'sa, 'se, 'ad> {
-    /// Minimum number of lanes (degree of parallelism).
-    pub const MIN_LANES: u32 = 1;
-    /// Maximum number of lanes (degree of parallelism).
-    pub const MAX_LANES: u32 = 0xFFFFFF;
-
-    /// Number of synchronization points between lanes per pass.
-    pub const SYNC_POINTS: u32 = 4;
-
-    /// Minimum number of threads.
-    pub const MIN_THREADS: u32 = 1;
-    /// Maximum number of threads.
-    pub const MAX_THREADS: u32 = 0xFFFFFF;
-
-    /// Minimum digest size in bytes.
-    pub const MIN_OUTLEN: u32 = 4;
-    /// Maximum digest size in bytes.
-    pub const MAX_OUTLEN: u32 = 0xFFFFFFFF;
-
-    /// Minimum number of passes.
-    pub const MIN_TIME: u32 = 1;
-    /// Maximum number of passes.
-    pub const MAX_TIME: u32 = 0xFFFFFFFF;
-
-    /// Minimum password length in bytes.
-    pub const MIN_PWD_LENGTH: u32 = 0;
-    /// Maximum password length in bytes.
-    pub const MAX_PWD_LENGTH: u32 = 0xFFFFFFFF;
-
-    /// Minimum associated data length in bytes.
-    pub const MIN_AD_LENGTH: u32 = 0;
-    /// Maximum associated data length in bytes.
-    pub const MAX_AD_LENGTH: u32 = 0xFFFFFFFF;
-
-    /// Minimum salt length in bytes.
-    pub const MIN_SALT_LENGTH: u32 = 8;
-    /// Maximum salt length in bytes.
-    pub const MAX_SALT_LENGTH: u32 = 0xFFFFFFFF;
-
-    /// Minimum key length in bytes.
-    pub const MIN_SECRET_LENGTH: u32 = 0;
-    /// Maximum key length in bytes.
-    pub const MAX_SECRET_LENGTH: u32 = 0xFFFFFFFF;
-
-    pub fn try_to_c(&mut self) -> Result<sys::Argon2_Context, Error> {
-        use std::ptr;
-
-        Ok(sys::Argon2_Context {
-            out: self.out.as_mut_ptr(),
-            outlen: try_conv("context.out.len", self.out.len())?,
-            pwd: self.pwd.as_mut_ptr(),
-            pwdlen: try_conv("context.pwd.len", self.pwd.len())?,
-            salt: self.salt.as_mut_ptr(),
-            saltlen: try_conv("context.salt.len", self.salt.len())?,
-            secret: self.secret.as_mut().map(|s| s.as_mut_ptr()).unwrap_or(ptr::null_mut()),
-            secretlen: try_conv("context.secret.len", self.secret.as_ref().map(|s| s.len()).unwrap_or(0))?,
-            ad: self.ad.as_mut().map(|s| s.as_mut_ptr()).unwrap_or(ptr::null_mut()),
-            adlen: try_conv("context.ad.len", self.ad.as_ref().map(|s| s.len()).unwrap_or(0))?,
-            t_cost: self.t_cost,
-            m_cost: self.m_cost,
-            lanes: self.lanes,
-            threads: self.threads,
-            version: self.version.to_c() as _,
-            allocate_cbk: None,
-            free_cbk: None,
-            flags: self.flags.bits(),
-        })
-    }
-
-}
-
-/// Structure to hold Argon2 inputs. Unlike `Context`, this version owns all of the input values.
-pub struct OwnedContext {
-    /// Output array.
-    pub out:    Vec<u8>,
-    /// Password array.
-    pub pwd:    Vec<u8>,
-    /// Salt array.
-    pub salt:   Vec<u8>,
-    /// Secret array.
-    pub secret: Option<Vec<u8>>,
-    /// Associated data array.
-    pub ad:     Option<Vec<u8>>,
-
-    /// Number of passes.
-    pub t_cost: u32,
-    /// Amount of memory requested (KB)
-    pub m_cost: u32,
-    /// Number of lanes.
-    pub lanes:  u32,
-    /// Maximum number of threads.
-    pub threads:u32,
-
-    /// Version number.
-    pub version: Version,
-
-    /// Array of bool options
-    pub flags: Flags,
-}
-
-impl OwnedContext {
-    pub fn borrowed<'a>(&'a mut self) -> Context<'a, 'a, 'a, 'a, 'a> {
-        Context {
-            out: &mut self.out,
-            pwd: &mut self.pwd,
-            salt: &mut self.salt,
-            secret: self.secret.as_mut().map(|v| &mut v[0..]),
-            ad: self.ad.as_mut().map(|v| &mut v[0..]),
-            t_cost: self.t_cost,
-            m_cost: self.m_cost,
-            lanes: self.lanes,
-            threads: self.threads,
-            version: self.version,
-            flags: self.flags.clone(),
-        }
-    }
-
-    pub fn try_to_c(&mut self) -> Result<sys::Argon2_Context, Error> {
-        use std::ptr;
-
-        Ok(sys::Argon2_Context {
-            out: self.out.as_mut_ptr(),
-            outlen: try_conv("context.out.len", self.out.len())?,
-            pwd: self.pwd.as_mut_ptr(),
-            pwdlen: try_conv("context.pwd.len", self.pwd.len())?,
-            salt: self.salt.as_mut_ptr(),
-            saltlen: try_conv("context.salt.len", self.salt.len())?,
-            secret: self.secret.as_mut().map(|s| s.as_mut_ptr()).unwrap_or(ptr::null_mut()),
-            secretlen: try_conv("context.secret.len", self.secret.as_ref().map(|s| s.len()).unwrap_or(0))?,
-            ad: self.ad.as_mut().map(|s| s.as_mut_ptr()).unwrap_or(ptr::null_mut()),
-            adlen: try_conv("context.ad.len", self.ad.as_ref().map(|s| s.len()).unwrap_or(0))?,
-            t_cost: self.t_cost,
-            m_cost: self.m_cost,
-            lanes: self.lanes,
-            threads: self.threads,
-            version: self.version.to_c() as _,
-            allocate_cbk: None,
-            free_cbk: None,
-            flags: self.flags.bits(),
-        })
-    }
-}
-
-impl<'o, 'p, 'sa, 'se, 'ad> std::convert::TryFrom<&mut Context<'o, 'p, 'sa, 'se, 'ad>> for sys::Argon2_Context {
-    type Error = self::Error;
-
-    fn try_from(context: &mut Context<'o, 'p, 'sa, 'se, 'ad>) -> Result<Self, Self::Error> {
-        context.try_to_c()
-    }
-}
-
-impl std::convert::TryFrom<&mut OwnedContext> for sys::Argon2_Context {
-    type Error = self::Error;
-
-    fn try_from(context: &mut OwnedContext) -> Result<Self, Self::Error> {
-        context.try_to_c()
-    }
-}
-
-#[inline]
-fn try_conv<T, U: std::convert::TryFrom<T>>(param: &'static str, input: T) -> Result<U, Error> {
-    U::try_from(input).map_err(|_| Error::BadParam(param))
+    std::borrow::Cow::Owned(
+        std::ffi::CString::new(bytes).expect("Failed to create CString.")
+    )
 }
 
 #[cfg(test)]
@@ -457,41 +574,119 @@ mod test {
         assert_eq!("Argon2id", type2string(Variant::ID, true));
     }
 
+    fn hex_conv(bytes: &[u8], hex_dest: &mut [u8]) {
+        const DIGITS: &[u8] = b"0123456789abcdef";
+        for (idx, byte) in bytes.iter().enumerate() {
+            hex_dest[(idx * 2)] = DIGITS[((*byte >> 4) as usize) & 0xF];
+            hex_dest[(idx * 2) + 1] = DIGITS[(*byte as usize) & 0xF];
+        }
+    }
+
+    fn str_conv(bytes: &[u8]) -> &str {
+        std::str::from_utf8(bytes).expect("Bad UTF-8 conversion.")
+    }
+
+    fn tovec(a: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(a.len());
+        v.extend_from_slice(a);
+        return v
+    }
+
+    fn hashtest_bytes(version: Version, t: u32, m: u32, p: u32, pwd: &mut [u8], salt: &mut [u8], hexref: &mut [u8], mcfref: &mut [u8], variant: Variant) {
+        const OUTLEN: usize = 32;
+        const ENCODED_LEN: usize = 108;
+
+        let mut out = [0u8; OUTLEN];
+        let mut hex_out = [0u8; OUTLEN * 2 + 4];
+        let mut encoded = [0u8; ENCODED_LEN];
+
+        println!("HASH TEST: $v={:?} t={}, m={}, p = {}, pass={}, salt={}",
+                 version, t, m, p,
+                 unsafe { std::str::from_utf8_unchecked(pwd) },
+                 unsafe { std::str::from_utf8_unchecked(salt) },);
+
+        hash(t, 1<<m, p, Some(pwd), Some(salt), Some(&mut out), Some(&mut encoded), variant, version).expect("Test hash failed.");
+        hex_conv(&out, &mut hex_out);
+
+        assert_eq!(str_conv(hexref), str_conv(&hex_out[0..(OUTLEN * 2)]));
+
+        verify(
+            c_str(&encoded).expect("bad C string."), Some(pwd), variant
+        ).expect("Failed verify-1");
+
+        verify(
+            &c_str_cow(&mcfref), Some(pwd), variant
+        ).expect("Failed verify-1");
+    }
+
+    fn hashtest(version: Version, t: u32, m: u32, p: u32, pwd: &str, salt: &str, hexref: &str, mcfref: &str, variant: Variant) {
+        hashtest_bytes(
+            version, t, m, p,
+            &mut tovec(pwd.as_bytes()),
+            &mut tovec(salt.as_bytes()),
+            &mut tovec(hexref.as_bytes()),
+            &mut tovec(mcfref.as_bytes()),
+            variant);
+    }
+
+    macro_rules! check_error_code {
+        ($Code:ident, $Value:expr) => {
+            assert_eq!(Err(Error::Code(ErrorCode::$Code)), $Value)
+        }
+    }
+
     #[test]
-    fn test_hash_with_context() {
-        // @NOTE This is just a test for me to eyeball results with for now using --nocapture
+    fn test_argon2i_0x10() {
+        println!("Test Argon2i version number: 0x{:02X}", (Version::Version10).to_int());
+        hashtest(Version::Version10, 2, 16, 1, "password", "somesalt",
+             "f6c4db4a54e2a370627aff3db6176b94a2a209a62c8e36152711802f7b30c694",
+             "$argon2i$m=65536,t=2,p=1$c29tZXNhbHQ$9sTbSlTio3Biev89thdrlKKiCaYsjjYVJxGAL3swxpQ",
+             Variant::I);
+        hashtest(Version::Version10, 2, 18, 1, "password", "somesalt",
+                 "3e689aaa3d28a77cf2bc72a51ac53166761751182f1ee292e3f677a7da4c2467",
+                 "$argon2i$m=262144,t=2,p=1$c29tZXNhbHQ$Pmiaqj0op3zyvHKlGsUxZnYXURgvHuKS4/Z3p9pMJGc",
+                 Variant::I);
+        hashtest(Version::Version10, 2, 8, 1, "password", "somesalt",
+                 "fd4dd83d762c49bdeaf57c47bdcd0c2f1babf863fdeb490df63ede9975fccf06",
+                 "$argon2i$m=256,t=2,p=1$c29tZXNhbHQ$/U3YPXYsSb3q9XxHvc0MLxur+GP960kN9j7emXX8zwY",
+                 Variant::I);
+        hashtest(Version::Version10, 2, 8, 2, "password", "somesalt",
+                 "b6c11560a6a9d61eac706b79a2f97d68b4463aa3ad87e00c07e2b01e90c564fb",
+                 "$argon2i$m=256,t=2,p=2$c29tZXNhbHQ$tsEVYKap1h6scGt5ovl9aLRGOqOth+AMB+KwHpDFZPs",
+                 Variant::I);
+        hashtest(Version::Version10, 1, 16, 1, "password", "somesalt",
+                 "81630552b8f3b1f48cdb1992c4c678643d490b2b5eb4ff6c4b3438b5621724b2",
+                 "$argon2i$m=65536,t=1,p=1$c29tZXNhbHQ$gWMFUrjzsfSM2xmSxMZ4ZD1JCytetP9sSzQ4tWIXJLI",
+                 Variant::I);
+        hashtest(Version::Version10, 4, 16, 1, "password", "somesalt",
+                 "f212f01615e6eb5d74734dc3ef40ade2d51d052468d8c69440a3a1f2c1c2847b",
+                 "$argon2i$m=65536,t=4,p=1$c29tZXNhbHQ$8hLwFhXm6110c03D70Ct4tUdBSRo2MaUQKOh8sHChHs",
+                 Variant::I);
+        hashtest(Version::Version10, 2, 16, 1, "differentpassword", "somesalt",
+                 "e9c902074b6754531a3a0be519e5baf404b30ce69b3f01ac3bf21229960109a3",
+                 "$argon2i$m=65536,t=2,p=1$c29tZXNhbHQ$6ckCB0tnVFMaOgvlGeW69ASzDOabPwGsO/ISKZYBCaM",
+                 Variant::I);
+        hashtest(Version::Version10, 2, 16, 1, "password", "diffsalt",
+                 "79a103b90fe8aef8570cb31fc8b22259778916f8336b7bdac3892569d4f1c497",
+                 "$argon2i$m=65536,t=2,p=1$ZGlmZnNhbHQ$eaEDuQ/orvhXDLMfyLIiWXeJFvgza3vaw4kladTxxJc",
+                 Variant::I);
 
-        const HASHLEN: usize = 32;
-        const SALTLEN: usize = 16;
-        const PASSLEN: usize = 8;
-        const PASSWD: &[u8] = b"password";
+        check_error_code!(DecodingFail, verify(&c_str_cow(b"$argon2i$m=65536,t=2,p=1c29tZXNhbHQ$9sTbSlTio3Biev89thdrlKKiCaYsjjYVJxGAL3swxpQ"),
+               Some(b"password"), Variant::I));
+        check_error_code!(DecodingFail, verify(&c_str_cow(b"$argon2i$m=65536,t=2,p=1$c29tZXNhbHQ9sTbSlTio3Biev89thdrlKKiCaYsjjYVJxGAL3swxpQ"),
+               Some(b"password"), Variant::I));
+        check_error_code!(SaltTooShort, verify(&c_str_cow(b"$argon2i$m=65536,t=2,p=1$$9sTbSlTio3Biev89thdrlKKiCaYsjjYVJxGAL3swxpQ"),
+               Some(b"password"), Variant::I));
+        check_error_code!(VerifyMismatch, verify(&c_str_cow(b"$argon2i$m=65536,t=2,p=1$c29tZXNhbHQ$b2G3seW+uPzerwQQC+/E1K50CLLO7YXy0JRcaTuswRo"),
+               Some(b"password"), Variant::I));
+    }
 
-        let mut hash = [0; HASHLEN];
-        let mut salt = [0; SALTLEN];
-        let mut pwd = [0; PASSLEN];
-        assert_eq!(PASSLEN, PASSWD.len());
-        (&mut pwd[0..]).copy_from_slice(PASSWD);
-
-        let t_cost = 2;         // 1-pass computation
-        let m_cost = 1 << 16;   // 64 mebibytes memory usage
-        let parallelism = 1;    // number of threads and lanes
-
-        let mut context = Context {
-            out: &mut hash,
-            salt: &mut salt,
-            pwd: &mut pwd,
-            secret: None,
-            ad: None,
-            t_cost: t_cost,
-            m_cost: m_cost,
-            lanes: parallelism,
-            threads: parallelism,
-            version: Version::Version13,
-            flags: Flags::DEFAULT,
-        };
-
-        ctx(&mut context, Variant::I).expect("Failed to hash password.");
-
-        println!("HASH: {:?}", &hash[0..]);
+    #[test]
+    #[ignore]
+    fn test_argon2i_0x10_large_ram() {
+        hashtest(Version::Version10, 2, 20, 1, "password", "somesalt",
+                "9690ec55d28d3ed32562f2e73ea62b02b018757643a2ae6e79528459de8106e9",
+                "$argon2i$m=1048576,t=2,p=1$c29tZXNhbHQ$lpDsVdKNPtMlYvLnPqYrArAYdXZDoq5ueVKEWd6BBuk",
+                Variant::I);
     }
 }
